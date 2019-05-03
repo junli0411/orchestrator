@@ -37,7 +37,6 @@ import (
 	"github.com/github/orchestrator/go/config"
 	"github.com/github/orchestrator/go/discovery"
 	"github.com/github/orchestrator/go/inst"
-	"github.com/github/orchestrator/go/kv"
 	"github.com/github/orchestrator/go/logic"
 	"github.com/github/orchestrator/go/metrics/query"
 	"github.com/github/orchestrator/go/process"
@@ -67,6 +66,7 @@ var apiSynonyms = map[string]string{
 	"regroup-slaves-pgtid":       "regroup-replicas-pgtid",
 	"detach-slave":               "detach-replica",
 	"reattach-slave":             "reattach-replica",
+	"detach-slave-master-host":   "detach-replica-master-host",
 	"reattach-slave-master-host": "reattach-replica-master-host",
 	"cluster-osc-slaves":         "cluster-osc-replicas",
 	"start-slave":                "start-replica",
@@ -125,7 +125,7 @@ var discoveryMetrics = collection.CreateOrReturnCollection("DISCOVERY_METRICS")
 var queryMetrics = collection.CreateOrReturnCollection("BACKEND_WRITES")
 
 func (this *HttpAPI) getInstanceKey(host string, port string) (inst.InstanceKey, error) {
-	instanceKey, err := inst.NewInstanceKeyFromStrings(host, port)
+	instanceKey, err := inst.NewResolveInstanceKeyStrings(host, port)
 	if err != nil {
 		return emptyInstanceKey, err
 	}
@@ -134,6 +134,14 @@ func (this *HttpAPI) getInstanceKey(host string, port string) (inst.InstanceKey,
 		return emptyInstanceKey, err
 	}
 	return *instanceKey, nil
+}
+
+func getTag(params martini.Params, req *http.Request) (tag *inst.Tag, err error) {
+	tagString := req.URL.Query().Get("tag")
+	if tagString != "" {
+		return inst.ParseTag(tagString)
+	}
+	return inst.NewTag(params["tagName"], params["tagValue"])
 }
 
 func (this *HttpAPI) getBinlogCoordinates(logFile string, logPos string) (inst.BinlogCoordinates, error) {
@@ -183,13 +191,17 @@ func (this *HttpAPI) Instance(params martini.Params, r render.Render, req *http.
 // useful for bulk loads of a new set of instances and will not block
 // if the instance is slow to respond or not reachable.
 func (this *HttpAPI) AsyncDiscover(params martini.Params, r render.Render, req *http.Request, user auth.User) {
-	go this.Discover(params, r, req, user)
-
+	if !isAuthorizedForAction(req, user) {
+		Respond(r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		return
+	}
 	instanceKey, err := this.getInstanceKey(params["host"], params["port"])
 	if err != nil {
 		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
+	go this.Discover(params, r, req, user)
+
 	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Asynchronous discovery initiated for Instance: %+v", instanceKey)})
 }
 
@@ -200,7 +212,6 @@ func (this *HttpAPI) Discover(params martini.Params, r render.Render, req *http.
 		return
 	}
 	instanceKey, err := this.getInstanceKey(params["host"], params["port"])
-
 	if err != nil {
 		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
@@ -211,7 +222,11 @@ func (this *HttpAPI) Discover(params martini.Params, r render.Render, req *http.
 		return
 	}
 
-	go orcraft.PublishCommand("discover", instanceKey)
+	if orcraft.IsRaftEnabled() {
+		orcraft.PublishCommand("discover", instanceKey)
+	} else {
+		logic.DiscoverInstance(instanceKey)
+	}
 
 	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Instance discovered: %+v", instance.Key), Details: instance})
 }
@@ -245,7 +260,7 @@ func (this *HttpAPI) Forget(params martini.Params, r render.Render, req *http.Re
 		return
 	}
 	// We ignore errors: we're looking to do a destructive operation anyhow.
-	rawInstanceKey, _ := inst.NewRawInstanceKey(fmt.Sprintf("%s:%s", params["host"], params["port"]))
+	rawInstanceKey, _ := inst.NewRawInstanceKeyStrings(params["host"], params["port"])
 
 	if orcraft.IsRaftEnabled() {
 		orcraft.PublishCommand("forget", rawInstanceKey)
@@ -356,16 +371,35 @@ func (this *HttpAPI) EndMaintenanceByInstanceKey(params martini.Params, r render
 	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Maintenance ended: %+v", instanceKey), Details: instanceKey})
 }
 
+// EndMaintenanceByInstanceKey terminates maintenance mode for given instance
+func (this *HttpAPI) InMaintenance(params martini.Params, r render.Render, req *http.Request, user auth.User) {
+	instanceKey, err := this.getInstanceKey(params["host"], params["port"])
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	inMaintenance, err := inst.InMaintenance(&instanceKey)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	responseDetails := ""
+	if inMaintenance {
+		responseDetails = instanceKey.StringCode()
+	}
+	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("%+v", inMaintenance), Details: responseDetails})
+}
+
 // Maintenance provides list of instance under active maintenance
 func (this *HttpAPI) Maintenance(params martini.Params, r render.Render, req *http.Request) {
-	instanceKeys, err := inst.ReadActiveMaintenance()
+	maintenanceList, err := inst.ReadActiveMaintenance()
 
 	if err != nil {
 		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	r.JSON(http.StatusOK, instanceKeys)
+	r.JSON(http.StatusOK, maintenanceList)
 }
 
 // BeginDowntime sets a downtime flag with default duration
@@ -565,9 +599,9 @@ func (this *HttpAPI) ResetSlave(params martini.Params, r render.Render, req *htt
 	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica reset on %+v", instance.Key), Details: instance})
 }
 
-// DetachReplica corrupts a replica's binlog corrdinates (though encodes it in such way
-// that is reversible), effectively breaking replication
-func (this *HttpAPI) DetachReplica(params martini.Params, r render.Render, req *http.Request, user auth.User) {
+// DetachReplicaMasterHost detaches a replica from its master by setting an invalid
+// (yet revertible) host name
+func (this *HttpAPI) DetachReplicaMasterHost(params martini.Params, r render.Render, req *http.Request, user auth.User) {
 	if !isAuthorizedForAction(req, user) {
 		Respond(r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
 		return
@@ -578,7 +612,7 @@ func (this *HttpAPI) DetachReplica(params martini.Params, r render.Render, req *
 		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	instance, err := inst.DetachReplicaOperation(&instanceKey)
+	instance, err := inst.DetachReplicaMasterHost(&instanceKey)
 	if err != nil {
 		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
@@ -587,29 +621,7 @@ func (this *HttpAPI) DetachReplica(params martini.Params, r render.Render, req *
 	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica detached: %+v", instance.Key), Details: instance})
 }
 
-// ReattachReplica reverts a DetachReplica commands by reassigning the correct
-// binlog coordinates to an instance
-func (this *HttpAPI) ReattachReplica(params martini.Params, r render.Render, req *http.Request, user auth.User) {
-	if !isAuthorizedForAction(req, user) {
-		Respond(r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
-		return
-	}
-	instanceKey, err := this.getInstanceKey(params["host"], params["port"])
-
-	if err != nil {
-		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
-		return
-	}
-	instance, err := inst.ReattachReplicaOperation(&instanceKey)
-	if err != nil {
-		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
-		return
-	}
-
-	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Replica reattached: %+v", instance.Key), Details: instance})
-}
-
-// ReattachReplicaMasterHost reverts a achReplicaMasterHost command
+// ReattachReplicaMasterHost reverts a detachReplicaMasterHost command
 // by resoting the original master hostname in CHANGE MASTER TO
 func (this *HttpAPI) ReattachReplicaMasterHost(params martini.Params, r render.Render, req *http.Request, user auth.User) {
 	if !isAuthorizedForAction(req, user) {
@@ -671,6 +683,64 @@ func (this *HttpAPI) DisableGTID(params martini.Params, r render.Render, req *ht
 	}
 
 	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Disabled GTID on %+v", instance.Key), Details: instance})
+}
+
+// LocateErrantGTID identifies the binlog positions for errant GTIDs on an instance
+func (this *HttpAPI) LocateErrantGTID(params martini.Params, r render.Render, req *http.Request, user auth.User) {
+	instanceKey, err := this.getInstanceKey(params["host"], params["port"])
+
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	errantBinlogs, err := inst.LocateErrantGTID(&instanceKey)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("located errant GTID"), Details: errantBinlogs})
+}
+
+// ErrantGTIDResetMaster removes errant transactions on a server by way of RESET MASTER
+func (this *HttpAPI) ErrantGTIDResetMaster(params martini.Params, r render.Render, req *http.Request, user auth.User) {
+	if !isAuthorizedForAction(req, user) {
+		Respond(r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		return
+	}
+	instanceKey, err := this.getInstanceKey(params["host"], params["port"])
+
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	instance, err := inst.ErrantGTIDResetMaster(&instanceKey)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+
+	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Removed errant GTID on %+v and issued a RESET MASTER", instance.Key), Details: instance})
+}
+
+// ErrantGTIDInjectEmpty removes errant transactions by injecting and empty transaction on the cluster's master
+func (this *HttpAPI) ErrantGTIDInjectEmpty(params martini.Params, r render.Render, req *http.Request, user auth.User) {
+	if !isAuthorizedForAction(req, user) {
+		Respond(r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		return
+	}
+	instanceKey, err := this.getInstanceKey(params["host"], params["port"])
+
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	instance, clusterMaster, countInjectedTransactions, err := inst.ErrantGTIDInjectEmpty(&instanceKey)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+
+	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Have injected %+v transactions on cluster master %+v", countInjectedTransactions, clusterMaster.Key), Details: instance})
 }
 
 // MoveBelow attempts to move an instance below its supposed sibling
@@ -784,7 +854,7 @@ func (this *HttpAPI) TakeMaster(params martini.Params, r render.Render, req *htt
 		return
 	}
 
-	instance, err := inst.TakeMaster(&instanceKey)
+	instance, err := inst.TakeMaster(&instanceKey, false)
 	if err != nil {
 		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
@@ -1062,7 +1132,7 @@ func (this *HttpAPI) RegroupReplicasGTID(params martini.Params, r render.Render,
 		return
 	}
 
-	lostReplicas, movedReplicas, cannotReplicateReplicas, promotedReplica, err := inst.RegroupReplicasGTID(&instanceKey, false, nil)
+	lostReplicas, movedReplicas, cannotReplicateReplicas, promotedReplica, err := inst.RegroupReplicasGTID(&instanceKey, false, nil, nil, nil)
 	lostReplicas = append(lostReplicas, cannotReplicateReplicas...)
 
 	if err != nil {
@@ -1266,6 +1336,38 @@ func (this *HttpAPI) FlushBinaryLogs(params martini.Params, r render.Render, req
 	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Binary logs flushed on: %+v", instance.Key), Details: instance})
 }
 
+// PurgeBinaryLogs purges binary logs up to given binlog file
+func (this *HttpAPI) PurgeBinaryLogs(params martini.Params, r render.Render, req *http.Request, user auth.User) {
+	if !isAuthorizedForAction(req, user) {
+		Respond(r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		return
+	}
+	instanceKey, err := this.getInstanceKey(params["host"], params["port"])
+
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	logFile := params["logFile"]
+	if logFile == "" {
+		Respond(r, &APIResponse{Code: ERROR, Message: "purge-binary-logs: expected log file name or 'latest'"})
+		return
+	}
+	force := (req.URL.Query().Get("force") == "true") || (params["force"] == "true")
+	var instance *inst.Instance
+	if logFile == "latest" {
+		instance, err = inst.PurgeBinaryLogsToLatest(&instanceKey, force)
+	} else {
+		instance, err = inst.PurgeBinaryLogsTo(&instanceKey, logFile, force)
+	}
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+
+	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Binary logs flushed on: %+v", instance.Key), Details: instance})
+}
+
 // RestartSlaveStatements receives a query to execute that requires a replication restart to apply.
 // As an example, this may be `set global rpl_semi_sync_slave_enabled=1`. orchestrator will check
 // replication status on given host and will wrap with appropriate stop/start statements, if need be.
@@ -1317,6 +1419,80 @@ func (this *HttpAPI) MasterEquivalent(params martini.Params, r render.Render, re
 	}
 
 	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Found %+v equivalent coordinates", len(equivalentCoordinates)), Details: equivalentCoordinates})
+}
+
+// CanReplicateFrom attempts to move an instance below another via pseudo GTID matching of binlog entries
+func (this *HttpAPI) CanReplicateFrom(params martini.Params, r render.Render, req *http.Request, user auth.User) {
+	instanceKey, err := this.getInstanceKey(params["host"], params["port"])
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	instance, found, err := inst.ReadInstance(&instanceKey)
+	if (!found) || (err != nil) {
+		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", instanceKey)})
+		return
+	}
+	belowKey, err := this.getInstanceKey(params["belowHost"], params["belowPort"])
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	belowInstance, found, err := inst.ReadInstance(&belowKey)
+	if (!found) || (err != nil) {
+		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", belowKey)})
+		return
+	}
+
+	canReplicate, err := instance.CanReplicateFrom(belowInstance)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+
+	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("%t", canReplicate), Details: belowKey})
+}
+
+// CanReplicateFromGTID attempts to move an instance below another via GTID.
+func (this *HttpAPI) CanReplicateFromGTID(params martini.Params, r render.Render, req *http.Request, user auth.User) {
+	instanceKey, err := this.getInstanceKey(params["host"], params["port"])
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	instance, found, err := inst.ReadInstance(&instanceKey)
+	if (!found) || (err != nil) {
+		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", instanceKey)})
+		return
+	}
+	belowKey, err := this.getInstanceKey(params["belowHost"], params["belowPort"])
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	belowInstance, found, err := inst.ReadInstance(&belowKey)
+	if (!found) || (err != nil) {
+		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot read instance: %+v", belowKey)})
+		return
+	}
+
+	canReplicate, err := instance.CanReplicateFrom(belowInstance)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	if !canReplicate {
+		Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("%t", canReplicate), Details: belowKey})
+		return
+	}
+	err = inst.CheckMoveViaGTID(instance, belowInstance)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	canReplicate = (err == nil)
+
+	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("%t", canReplicate), Details: belowKey})
 }
 
 // setSemiSyncMaster
@@ -1573,7 +1749,13 @@ func (this *HttpAPI) SetClusterAliasManualOverride(params martini.Params, r rend
 	clusterName := params["clusterName"]
 	alias := req.URL.Query().Get("alias")
 
-	err := inst.SetClusterAliasManualOverride(clusterName, alias)
+	var err error
+	if orcraft.IsRaftEnabled() {
+		_, err = orcraft.PublishCommand("set-cluster-alias-manual-override", []string{clusterName, alias})
+	} else {
+		err = inst.SetClusterAliasManualOverride(clusterName, alias)
+	}
+
 	if err != nil {
 		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
@@ -1605,6 +1787,126 @@ func (this *HttpAPI) ClustersInfo(params martini.Params, r render.Render, req *h
 	r.JSON(http.StatusOK, clustersInfo)
 }
 
+// Tags lists existing tags for a given instance
+func (this *HttpAPI) Tags(params martini.Params, r render.Render, req *http.Request) {
+	instanceKey, err := this.getInstanceKey(params["host"], params["port"])
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+
+	tags, err := inst.ReadInstanceTags(&instanceKey)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	tagStrings := []string{}
+	for _, tag := range tags {
+		tagStrings = append(tagStrings, tag.String())
+	}
+	r.JSON(http.StatusOK, tagStrings)
+}
+
+// TagValue returns a given tag's value for a specific instance
+func (this *HttpAPI) TagValue(params martini.Params, r render.Render, req *http.Request) {
+	instanceKey, err := this.getInstanceKey(params["host"], params["port"])
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	tag, err := getTag(params, req)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	tagExists, err := inst.ReadInstanceTag(&instanceKey, tag)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	if tagExists {
+		r.JSON(http.StatusOK, tag.TagValue)
+	} else {
+		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("tag %s not found for %+v", tag.TagName, instanceKey)})
+	}
+}
+
+// Tagged return instance keys tagged by "tag" query param
+func (this *HttpAPI) Tagged(params martini.Params, r render.Render, req *http.Request) {
+	tagsString := req.URL.Query().Get("tag")
+	instanceKeyMap, err := inst.GetInstanceKeysByTags(tagsString)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+
+	r.JSON(http.StatusOK, instanceKeyMap.GetInstanceKeys())
+}
+
+// Tags adds a tag to a given instance
+func (this *HttpAPI) Tag(params martini.Params, r render.Render, req *http.Request) {
+	instanceKey, err := this.getInstanceKey(params["host"], params["port"])
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+
+	tag, err := getTag(params, req)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	if orcraft.IsRaftEnabled() {
+		_, err = orcraft.PublishCommand("put-instance-tag", inst.InstanceTag{Key: instanceKey, T: *tag})
+	} else {
+		err = inst.PutInstanceTag(&instanceKey, tag)
+	}
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+
+	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("%+v tagged with %s", instanceKey, tag.String()), Details: instanceKey})
+}
+
+// Untag removes a tag from an instance
+func (this *HttpAPI) Untag(params martini.Params, r render.Render, req *http.Request) {
+	instanceKey, err := this.getInstanceKey(params["host"], params["port"])
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+
+	tag, err := getTag(params, req)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	untagged, err := inst.Untag(&instanceKey, tag)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+
+	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("%s removed from %+v instances", tag.TagName, len(*untagged)), Details: untagged.GetInstanceKeys()})
+}
+
+// UntagAll removes a tag from all matching instances
+func (this *HttpAPI) UntagAll(params martini.Params, r render.Render, req *http.Request) {
+	tag, err := getTag(params, req)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	untagged, err := inst.Untag(nil, tag)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+
+	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("%s removed from %+v instances", tag.TagName, len(*untagged)), Details: untagged.GetInstanceKeys()})
+}
+
 // Write a cluster's master (or all clusters masters) to kv stores.
 // This should generally only happen once in a lifetime of a cluster. Otherwise KV
 // stores are updated via failovers.
@@ -1614,23 +1916,12 @@ func (this *HttpAPI) SubmitMastersToKvStores(params martini.Params, r render.Ren
 		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
-	kvPairs, err := inst.GetMastersKVPairs(clusterName)
+	kvPairs, submittedCount, err := logic.SubmitMastersToKvStores(clusterName, true)
 	if err != nil {
 		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
-	for _, kvPair := range kvPairs {
-		if orcraft.IsRaftEnabled() {
-			_, err = orcraft.PublishCommand("put-key-value", kvPair)
-		} else {
-			err = kv.PutKVPair(kvPair)
-		}
-		if err != nil {
-			Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
-			return
-		}
-	}
-	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Submitted %d masters", len(kvPairs)), Details: kvPairs})
+	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Submitted %d masters", submittedCount), Details: kvPairs})
 }
 
 // Clusters provides list of known masters
@@ -1653,7 +1944,7 @@ func (this *HttpAPI) ClusterMaster(params martini.Params, r render.Render, req *
 		return
 	}
 
-	masters, err := inst.ReadClusterWriteableMaster(clusterName)
+	masters, err := inst.ReadClusterMaster(clusterName)
 	if err != nil {
 		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
@@ -1743,19 +2034,6 @@ func (this *HttpAPI) Audit(params martini.Params, r render.Render, req *http.Req
 	}
 
 	r.JSON(http.StatusOK, audits)
-}
-
-// LongQueries lists queries running for a long time, on all instances, optionally filtered by
-// arbitrary text
-func (this *HttpAPI) LongQueries(params martini.Params, r render.Render, req *http.Request) {
-	longQueries, err := inst.ReadLongRunningProcesses(params["filter"])
-
-	if err != nil {
-		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
-		return
-	}
-
-	r.JSON(http.StatusOK, longQueries)
 }
 
 // HostnameResolveCache shows content of in-memory hostname cache
@@ -2571,6 +2849,20 @@ func (this *HttpAPI) RaftHealth(params martini.Params, r render.Render, req *htt
 	r.JSON(http.StatusOK, "healthy")
 }
 
+// RaftFollowerHealthReport is initiated by followers to report their identity and health to the raft leader.
+func (this *HttpAPI) RaftFollowerHealthReport(params martini.Params, r render.Render, req *http.Request, user auth.User) {
+	if !orcraft.IsRaftEnabled() {
+		Respond(r, &APIResponse{Code: ERROR, Message: "raft-state: not running with raft setup"})
+		return
+	}
+	err := orcraft.OnHealthReport(params["authenticationToken"], params["raftBind"], params["raftAdvertise"])
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot create snapshot: %+v", err)})
+		return
+	}
+	r.JSON(http.StatusOK, "health reported")
+}
+
 // RaftSnapshot instructs raft to take a snapshot
 func (this *HttpAPI) RaftSnapshot(params martini.Params, r render.Render, req *http.Request, user auth.User) {
 	if !orcraft.IsRaftEnabled() {
@@ -2599,7 +2891,7 @@ func (this *HttpAPI) ReloadConfiguration(params martini.Params, r render.Render,
 
 // ReplicationAnalysis retuens list of issues
 func (this *HttpAPI) replicationAnalysis(clusterName string, instanceKey *inst.InstanceKey, params martini.Params, r render.Render, req *http.Request) {
-	analysis, err := inst.GetReplicationAnalysis(clusterName, true, false)
+	analysis, err := inst.GetReplicationAnalysis(clusterName, &inst.ReplicationAnalysisHints{IncludeDowntimed: true})
 	if err != nil {
 		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("Cannot get analysis: %+v", err)})
 		return
@@ -2703,7 +2995,9 @@ func (this *HttpAPI) GracefulMasterTakeover(params martini.Params, r render.Rend
 		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
 		return
 	}
-	topologyRecovery, _, err := logic.GracefulMasterTakeover(clusterName)
+	designatedKey, _ := this.getInstanceKey(params["designatedHost"], params["designatedPort"])
+	// designatedKey may be empty/invalid
+	topologyRecovery, _, err := logic.GracefulMasterTakeover(clusterName, &designatedKey)
 	if err != nil {
 		Respond(r, &APIResponse{Code: ERROR, Message: err.Error(), Details: topologyRecovery})
 		return
@@ -2739,6 +3033,40 @@ func (this *HttpAPI) ForceMasterFailover(params martini.Params, r render.Render,
 	}
 }
 
+// ForceMasterTakeover fails over a master (even if there's no particular problem with the master)
+func (this *HttpAPI) ForceMasterTakeover(params martini.Params, r render.Render, req *http.Request, user auth.User) {
+	if !isAuthorizedForAction(req, user) {
+		Respond(r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		return
+	}
+	clusterName, err := figureClusterName(getClusterHint(params))
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	designatedKey, _ := this.getInstanceKey(params["designatedHost"], params["designatedPort"])
+	designatedInstance, _, err := inst.ReadInstance(&designatedKey)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	if designatedInstance == nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: "Instance not found"})
+		return
+	}
+
+	topologyRecovery, err := logic.ForceMasterTakeover(clusterName, designatedInstance)
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
+		return
+	}
+	if topologyRecovery.SuccessorKey != nil {
+		Respond(r, &APIResponse{Code: OK, Message: "Master failed over", Details: topologyRecovery})
+	} else {
+		Respond(r, &APIResponse{Code: ERROR, Message: "Master not failed over", Details: topologyRecovery})
+	}
+}
+
 // Registers promotion preference for given instance
 func (this *HttpAPI) RegisterCandidate(params martini.Params, r render.Render, req *http.Request, user auth.User) {
 	if !isAuthorizedForAction(req, user) {
@@ -2756,7 +3084,7 @@ func (this *HttpAPI) RegisterCandidate(params martini.Params, r render.Render, r
 		return
 	}
 
-	candidate := inst.NewCandidateDatabaseInstance(&instanceKey, promotionRule)
+	candidate := inst.NewCandidateDatabaseInstance(&instanceKey, promotionRule).WithCurrentTime()
 
 	if orcraft.IsRaftEnabled() {
 		_, err = orcraft.PublishCommand("register-candidate", candidate)
@@ -2923,7 +3251,7 @@ func (this *HttpAPI) AcknowledgeClusterRecoveries(params martini.Params, r rende
 		return
 	}
 
-	comment := req.URL.Query().Get("comment")
+	comment := strings.TrimSpace(req.URL.Query().Get("comment"))
 	if comment == "" {
 		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("No acknowledge comment given")})
 		return
@@ -2932,20 +3260,19 @@ func (this *HttpAPI) AcknowledgeClusterRecoveries(params martini.Params, r rende
 	if userId == "" {
 		userId = inst.GetMaintenanceOwner()
 	}
-	var countAcknowledgedRecoveries int64
 	if orcraft.IsRaftEnabled() {
 		ack := logic.NewRecoveryAcknowledgement(userId, comment)
 		ack.ClusterName = clusterName
-		orcraft.PublishCommand("ack-recovery", ack)
+		_, err = orcraft.PublishCommand("ack-recovery", ack)
 	} else {
-		countAcknowledgedRecoveries, err = logic.AcknowledgeClusterRecoveries(clusterName, userId, comment)
+		_, err = logic.AcknowledgeClusterRecoveries(clusterName, userId, comment)
 	}
 	if err != nil {
 		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Acknowledged %s recoveries on %+v", countAcknowledgedRecoveries, clusterName), Details: countAcknowledgedRecoveries})
+	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Acknowledged cluster recoveries"), Details: clusterName})
 }
 
 // ClusterInfo provides details of a given cluster
@@ -2961,7 +3288,7 @@ func (this *HttpAPI) AcknowledgeInstanceRecoveries(params martini.Params, r rend
 		return
 	}
 
-	comment := req.URL.Query().Get("comment")
+	comment := strings.TrimSpace(req.URL.Query().Get("comment"))
 	if comment == "" {
 		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("No acknowledge comment given")})
 		return
@@ -2970,20 +3297,19 @@ func (this *HttpAPI) AcknowledgeInstanceRecoveries(params martini.Params, r rend
 	if userId == "" {
 		userId = inst.GetMaintenanceOwner()
 	}
-	var countAcknowledgedRecoveries int64
 	if orcraft.IsRaftEnabled() {
 		ack := logic.NewRecoveryAcknowledgement(userId, comment)
 		ack.Key = instanceKey
-		orcraft.PublishCommand("ack-recovery", ack)
+		_, err = orcraft.PublishCommand("ack-recovery", ack)
 	} else {
-		countAcknowledgedRecoveries, err = logic.AcknowledgeInstanceRecoveries(&instanceKey, userId, comment)
+		_, err = logic.AcknowledgeInstanceRecoveries(&instanceKey, userId, comment)
 	}
 	if err != nil {
 		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
 		return
 	}
 
-	r.JSON(http.StatusOK, countAcknowledgedRecoveries)
+	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Acknowledged instance recoveries"), Details: instanceKey})
 }
 
 // ClusterInfo provides details of a given cluster
@@ -2994,17 +3320,21 @@ func (this *HttpAPI) AcknowledgeRecovery(params martini.Params, r render.Render,
 	}
 	var err error
 	var recoveryId int64
+	var idParam string
 
 	// Ack either via id or uid
-	uid := params["uid"]
-	if uid == "" {
-		recoveryId, err = strconv.ParseInt(params["recoveryId"], 10, 0)
+	recoveryUid := params["uid"]
+	if recoveryUid == "" {
+		idParam = params["recoveryId"]
+		recoveryId, err = strconv.ParseInt(idParam, 10, 0)
 		if err != nil {
 			Respond(r, &APIResponse{Code: ERROR, Message: err.Error()})
 			return
 		}
+	} else {
+		idParam = recoveryUid
 	}
-	comment := req.URL.Query().Get("comment")
+	comment := strings.TrimSpace(req.URL.Query().Get("comment"))
 	if comment == "" {
 		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("No acknowledge comment given")})
 		return
@@ -3013,17 +3343,16 @@ func (this *HttpAPI) AcknowledgeRecovery(params martini.Params, r render.Render,
 	if userId == "" {
 		userId = inst.GetMaintenanceOwner()
 	}
-	var countAcknowledgedRecoveries int64
 	if orcraft.IsRaftEnabled() {
 		ack := logic.NewRecoveryAcknowledgement(userId, comment)
 		ack.Id = recoveryId
-		ack.UID = uid
-		orcraft.PublishCommand("ack-recovery", ack)
+		ack.UID = recoveryUid
+		_, err = orcraft.PublishCommand("ack-recovery", ack)
 	} else {
-		if uid != "" {
-			countAcknowledgedRecoveries, err = logic.AcknowledgeRecoveryByUID(uid, userId, comment)
+		if recoveryUid != "" {
+			_, err = logic.AcknowledgeRecoveryByUID(recoveryUid, userId, comment)
 		} else {
-			countAcknowledgedRecoveries, err = logic.AcknowledgeRecovery(recoveryId, userId, comment)
+			_, err = logic.AcknowledgeRecovery(recoveryId, userId, comment)
 		}
 	}
 
@@ -3032,7 +3361,39 @@ func (this *HttpAPI) AcknowledgeRecovery(params martini.Params, r render.Render,
 		return
 	}
 
-	r.JSON(http.StatusOK, countAcknowledgedRecoveries)
+	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Acknowledged recovery"), Details: idParam})
+}
+
+// ClusterInfo provides details of a given cluster
+func (this *HttpAPI) AcknowledgeAllRecoveries(params martini.Params, r render.Render, req *http.Request, user auth.User) {
+	if !isAuthorizedForAction(req, user) {
+		Respond(r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		return
+	}
+
+	comment := strings.TrimSpace(req.URL.Query().Get("comment"))
+	if comment == "" {
+		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("No acknowledge comment given")})
+		return
+	}
+	userId := getUserId(req, user)
+	if userId == "" {
+		userId = inst.GetMaintenanceOwner()
+	}
+	var err error
+	if orcraft.IsRaftEnabled() {
+		ack := logic.NewRecoveryAcknowledgement(userId, comment)
+		ack.AllRecoveries = true
+		_, err = orcraft.PublishCommand("ack-recovery", ack)
+	} else {
+		_, err = logic.AcknowledgeAllRecoveries(userId, comment)
+	}
+	if err != nil {
+		Respond(r, &APIResponse{Code: ERROR, Message: fmt.Sprintf("%+v", err)})
+		return
+	}
+
+	Respond(r, &APIResponse{Code: OK, Message: fmt.Sprintf("Acknowledged all recoveries"), Details: comment})
 }
 
 // BlockedRecoveries reads list of currently blocked recoveries, optionally filtered by cluster name
@@ -3048,7 +3409,12 @@ func (this *HttpAPI) BlockedRecoveries(params martini.Params, r render.Render, r
 }
 
 // DisableGlobalRecoveries globally disables recoveries
-func (this *HttpAPI) DisableGlobalRecoveries(params martini.Params, r render.Render, req *http.Request) {
+func (this *HttpAPI) DisableGlobalRecoveries(params martini.Params, r render.Render, req *http.Request, user auth.User) {
+	if !isAuthorizedForAction(req, user) {
+		Respond(r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		return
+	}
+
 	var err error
 	if orcraft.IsRaftEnabled() {
 		_, err = orcraft.PublishCommand("disable-global-recoveries", 0)
@@ -3065,7 +3431,12 @@ func (this *HttpAPI) DisableGlobalRecoveries(params martini.Params, r render.Ren
 }
 
 // EnableGlobalRecoveries globally enables recoveries
-func (this *HttpAPI) EnableGlobalRecoveries(params martini.Params, r render.Render, req *http.Request) {
+func (this *HttpAPI) EnableGlobalRecoveries(params martini.Params, r render.Render, req *http.Request, user auth.User) {
+	if !isAuthorizedForAction(req, user) {
+		Respond(r, &APIResponse{Code: ERROR, Message: "Unauthorized"})
+		return
+	}
+
 	var err error
 	if orcraft.IsRaftEnabled() {
 		_, err = orcraft.PublishCommand("enable-global-recoveries", 0)
@@ -3172,21 +3543,30 @@ func (this *HttpAPI) RegisterRequests(m *martini.ClassicMartini) {
 	// Replication, general:
 	this.registerAPIRequest(m, "enable-gtid/:host/:port", this.EnableGTID)
 	this.registerAPIRequest(m, "disable-gtid/:host/:port", this.DisableGTID)
+	this.registerAPIRequest(m, "locate-gtid-errant/:host/:port", this.LocateErrantGTID)
+	this.registerAPIRequest(m, "gtid-errant-reset-master/:host/:port", this.ErrantGTIDResetMaster)
+	this.registerAPIRequest(m, "gtid-errant-inject-empty/:host/:port", this.ErrantGTIDInjectEmpty)
 	this.registerAPIRequest(m, "skip-query/:host/:port", this.SkipQuery)
 	this.registerAPIRequest(m, "start-slave/:host/:port", this.StartSlave)
 	this.registerAPIRequest(m, "restart-slave/:host/:port", this.RestartSlave)
 	this.registerAPIRequest(m, "stop-slave/:host/:port", this.StopSlave)
 	this.registerAPIRequest(m, "stop-slave-nice/:host/:port", this.StopSlaveNicely)
 	this.registerAPIRequest(m, "reset-slave/:host/:port", this.ResetSlave)
-	this.registerAPIRequest(m, "detach-slave/:host/:port", this.DetachReplica)
-	this.registerAPIRequest(m, "reattach-slave/:host/:port", this.ReattachReplica)
+	this.registerAPIRequest(m, "detach-slave/:host/:port", this.DetachReplicaMasterHost)
+	this.registerAPIRequest(m, "reattach-slave/:host/:port", this.ReattachReplicaMasterHost)
+	this.registerAPIRequest(m, "detach-slave-master-host/:host/:port", this.DetachReplicaMasterHost)
 	this.registerAPIRequest(m, "reattach-slave-master-host/:host/:port", this.ReattachReplicaMasterHost)
 	this.registerAPIRequest(m, "flush-binary-logs/:host/:port", this.FlushBinaryLogs)
+	this.registerAPIRequest(m, "purge-binary-logs/:host/:port/:logFile", this.PurgeBinaryLogs)
 	this.registerAPIRequest(m, "restart-slave-statements/:host/:port", this.RestartSlaveStatements)
 	this.registerAPIRequest(m, "enable-semi-sync-master/:host/:port", this.EnableSemiSyncMaster)
 	this.registerAPIRequest(m, "disable-semi-sync-master/:host/:port", this.DisableSemiSyncMaster)
 	this.registerAPIRequest(m, "enable-semi-sync-replica/:host/:port", this.EnableSemiSyncReplica)
 	this.registerAPIRequest(m, "disable-semi-sync-replica/:host/:port", this.DisableSemiSyncReplica)
+
+	// Replication information:
+	this.registerAPIRequest(m, "can-replicate-from/:host/:port/:belowHost/:belowPort", this.CanReplicateFrom)
+	this.registerAPIRequest(m, "can-replicate-from-gtid/:host/:port/:belowHost/:belowPort", this.CanReplicateFromGTID)
 
 	// Instance:
 	this.registerAPIRequest(m, "set-read-only/:host/:port", this.SetReadOnly)
@@ -3235,6 +3615,18 @@ func (this *HttpAPI) RegisterRequests(m *martini.ClassicMartini) {
 	this.registerAPIRequest(m, "submit-masters-to-kv-stores", this.SubmitMastersToKvStores)
 	this.registerAPIRequest(m, "submit-masters-to-kv-stores/:clusterHint", this.SubmitMastersToKvStores)
 
+	// Tags:
+	this.registerAPIRequest(m, "tagged", this.Tagged)
+	this.registerAPIRequest(m, "tags/:host/:port", this.Tags)
+	this.registerAPIRequest(m, "tag-value/:host/:port", this.TagValue)
+	this.registerAPIRequest(m, "tag-value/:host/:port/:tagName", this.TagValue)
+	this.registerAPIRequest(m, "tag/:host/:port", this.Tag)
+	this.registerAPIRequest(m, "tag/:host/:port/:tagName/:tagValue", this.Tag)
+	this.registerAPIRequest(m, "untag/:host/:port", this.Untag)
+	this.registerAPIRequest(m, "untag/:host/:port/:tagName", this.Untag)
+	this.registerAPIRequest(m, "untag-all", this.UntagAll)
+	this.registerAPIRequest(m, "untag-all/:tagName/:tagValue", this.UntagAll)
+
 	// Instance management:
 	this.registerAPIRequest(m, "instance/:host/:port", this.Instance)
 	this.registerAPIRequest(m, "discover/:host/:port", this.Discover)
@@ -3244,7 +3636,9 @@ func (this *HttpAPI) RegisterRequests(m *martini.ClassicMartini) {
 	this.registerAPIRequest(m, "forget-cluster/:clusterHint", this.ForgetCluster)
 	this.registerAPIRequest(m, "begin-maintenance/:host/:port/:owner/:reason", this.BeginMaintenance)
 	this.registerAPIRequest(m, "end-maintenance/:host/:port", this.EndMaintenanceByInstanceKey)
+	this.registerAPIRequest(m, "in-maintenance/:host/:port", this.InMaintenance)
 	this.registerAPIRequest(m, "end-maintenance/:maintenanceKey", this.EndMaintenance)
+	this.registerAPIRequest(m, "maintenance", this.Maintenance)
 	this.registerAPIRequest(m, "begin-downtime/:host/:port/:owner/:reason", this.BeginDowntime)
 	this.registerAPIRequest(m, "begin-downtime/:host/:port/:owner/:reason/:duration", this.BeginDowntime)
 	this.registerAPIRequest(m, "end-downtime/:host/:port", this.EndDowntime)
@@ -3258,9 +3652,13 @@ func (this *HttpAPI) RegisterRequests(m *martini.ClassicMartini) {
 	this.registerAPIRequest(m, "recover-lite/:host/:port", this.RecoverLite)
 	this.registerAPIRequest(m, "recover-lite/:host/:port/:candidateHost/:candidatePort", this.RecoverLite)
 	this.registerAPIRequest(m, "graceful-master-takeover/:host/:port", this.GracefulMasterTakeover)
+	this.registerAPIRequest(m, "graceful-master-takeover/:host/:port/:designatedHost/:designatedPort", this.GracefulMasterTakeover)
 	this.registerAPIRequest(m, "graceful-master-takeover/:clusterHint", this.GracefulMasterTakeover)
+	this.registerAPIRequest(m, "graceful-master-takeover/:clusterHint/:designatedHost/:designatedPort", this.GracefulMasterTakeover)
 	this.registerAPIRequest(m, "force-master-failover/:host/:port", this.ForceMasterFailover)
 	this.registerAPIRequest(m, "force-master-failover/:clusterHint", this.ForceMasterFailover)
+	this.registerAPIRequest(m, "force-master-takeover/:clusterHint/:designatedHost/:designatedPort", this.ForceMasterTakeover)
+	this.registerAPIRequest(m, "force-master-takeover/:host/:port/:designatedHost/:designatedPort", this.ForceMasterTakeover)
 	this.registerAPIRequest(m, "register-candidate/:host/:port/:promotionRule", this.RegisterCandidate)
 	this.registerAPIRequest(m, "automated-recovery-filters", this.AutomatedRecoveryFilters)
 	this.registerAPIRequest(m, "audit-failure-detection", this.AuditFailureDetection)
@@ -3284,6 +3682,7 @@ func (this *HttpAPI) RegisterRequests(m *martini.ClassicMartini) {
 	this.registerAPIRequest(m, "ack-recovery/instance/:host/:port", this.AcknowledgeInstanceRecoveries)
 	this.registerAPIRequest(m, "ack-recovery/:recoveryId", this.AcknowledgeRecovery)
 	this.registerAPIRequest(m, "ack-recovery/uid/:uid", this.AcknowledgeRecovery)
+	this.registerAPIRequest(m, "ack-all-recoveries", this.AcknowledgeAllRecoveries)
 	this.registerAPIRequest(m, "blocked-recoveries", this.BlockedRecoveries)
 	this.registerAPIRequest(m, "blocked-recoveries/cluster/:clusterName", this.BlockedRecoveries)
 	this.registerAPIRequest(m, "disable-global-recoveries", this.DisableGlobalRecoveries)
@@ -3293,8 +3692,6 @@ func (this *HttpAPI) RegisterRequests(m *martini.ClassicMartini) {
 	// General
 	this.registerAPIRequest(m, "problems", this.Problems)
 	this.registerAPIRequest(m, "problems/:clusterName", this.Problems)
-	this.registerAPIRequest(m, "long-queries", this.LongQueries)
-	this.registerAPIRequest(m, "long-queries/:filter", this.LongQueries)
 	this.registerAPIRequest(m, "audit", this.Audit)
 	this.registerAPIRequest(m, "audit/:page", this.Audit)
 	this.registerAPIRequest(m, "audit/instance/:host/:port", this.Audit)
@@ -3302,7 +3699,6 @@ func (this *HttpAPI) RegisterRequests(m *martini.ClassicMartini) {
 	this.registerAPIRequest(m, "resolve/:host/:port", this.Resolve)
 
 	// Meta, no proxy
-	this.registerAPIRequestNoProxy(m, "maintenance", this.Maintenance)
 	this.registerAPIRequestNoProxy(m, "headers", this.Headers)
 	this.registerAPIRequestNoProxy(m, "health", this.Health)
 	this.registerAPIRequestNoProxy(m, "lb-check", this.LBCheck)
@@ -3317,6 +3713,7 @@ func (this *HttpAPI) RegisterRequests(m *martini.ClassicMartini) {
 	this.registerAPIRequestNoProxy(m, "raft-leader", this.RaftLeader)
 	this.registerAPIRequestNoProxy(m, "raft-health", this.RaftHealth)
 	this.registerAPIRequestNoProxy(m, "raft-snapshot", this.RaftSnapshot)
+	this.registerAPIRequestNoProxy(m, "raft-follower-health-report/:authenticationToken/:raftBind/:raftAdvertise", this.RaftFollowerHealthReport)
 	this.registerAPIRequestNoProxy(m, "reload-configuration", this.ReloadConfiguration)
 	this.registerAPIRequestNoProxy(m, "hostname-resolve-cache", this.HostnameResolveCache)
 	this.registerAPIRequestNoProxy(m, "reset-hostname-resolve-cache", this.ResetHostnameResolveCache)

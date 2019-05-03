@@ -19,6 +19,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -40,6 +41,7 @@ var configurationLoaded chan bool = make(chan bool)
 
 const (
 	HealthPollSeconds                            = 1
+	RaftHealthPollSeconds                        = 10
 	RecoveryPollSeconds                          = 1
 	ActiveNodeExpireSeconds                      = 5
 	BinlogFileHistoryDays                        = 1
@@ -76,6 +78,8 @@ var deprecatedConfigurationVariables = []string{
 	"HttpTimeoutSeconds",
 	"AgentAutoDiscover",
 	"PseudoGTIDCoordinatesHistoryHeuristicMinutes",
+	"PseudoGTIDPreferIndependentMultiMatch",
+	"MaxOutdatedKeysToShow",
 }
 
 // Configuration makes for orchestrator configuration input, which can be provided by user via JSON formatted file.
@@ -86,6 +90,7 @@ type Configuration struct {
 	EnableSyslog                               bool   // Should logs be directed (in addition) to syslog daemon?
 	ListenAddress                              string // Where orchestrator HTTP should listen for TCP
 	ListenSocket                               string // Where orchestrator HTTP should listen for unix socket (default: empty; when given, TCP is disabled)
+	HTTPAdvertise                              string // optional, for raft setups, what is the HTTP address this node will advertise to its peers (potentially use where behind NAT or when rerouting ports; example: "http://11.22.33.44:3030")
 	AgentsServerPort                           string // port orchestrator agents talk back to
 	MySQLTopologyUser                          string
 	MySQLTopologyPassword                      string // my.cnf style configuration file from where to pick credentials. Expecting `user`, `password` under `[client]` section
@@ -124,9 +129,11 @@ type Configuration struct {
 	MySQLOrchestratorReadTimeoutSeconds        int      // Number of seconds before backend mysql read operation is aborted (driver-side)
 	MySQLDiscoveryReadTimeoutSeconds           int      // Number of seconds before topology mysql read operation is aborted (driver-side). Used for discovery queries.
 	MySQLTopologyReadTimeoutSeconds            int      // Number of seconds before topology mysql read operation is aborted (driver-side). Used for all but discovery queries.
+	MySQLConnectionLifetimeSeconds             int      // Number of seconds the mysql driver will keep database connection alive before recycling it
 	DefaultInstancePort                        int      // In case port was not specified on command line
 	SlaveLagQuery                              string   // Synonym to ReplicationLagQuery
-	ReplicationLagQuery                        string   // custom query to check on replica lg (e.g. heartbeat table)
+	ReplicationLagQuery                        string   // custom query to check on replica lg (e.g. heartbeat table). Must return a single row with a single numeric column, which is the lag.
+	ReplicationCredentialsQuery                string   // custom query to get replication credentials. Must return a single row, with two text columns: 1st is username, 2nd is password. This is optional, and can be used by orchestrator to configure replication after master takeover or setup of co-masters. You need to ensure the orchestrator user has the privileges to run this query
 	DiscoverByShowSlaveHosts                   bool     // Attempt SHOW SLAVE HOSTS before PROCESSLIST
 	UseSuperReadOnly                           bool     // Should orchestrator super_read_only any time it sets read_only
 	InstancePollSeconds                        uint     // Number of seconds between instance reads
@@ -201,12 +208,12 @@ type Configuration struct {
 	UnseenAgentForgetHours                     uint              // Number of hours after which an unseen agent is forgotten
 	StaleSeedFailMinutes                       uint              // Number of minutes after which a stale (no progress) seed is considered failed.
 	SeedAcceptableBytesDiff                    int64             // Difference in bytes between seed source & target data size that is still considered as successful copy
+	SeedWaitSecondsBeforeSend                  int64             // Number of seconds for waiting before start send data command on agent
 	AutoPseudoGTID                             bool              // Should orchestrator automatically inject Pseudo-GTID entries to the masters
 	PseudoGTIDPattern                          string            // Pattern to look for in binary logs that makes for a unique entry (pseudo GTID). When empty, Pseudo-GTID based refactoring is disabled.
 	PseudoGTIDPatternIsFixedSubstring          bool              // If true, then PseudoGTIDPattern is not treated as regular expression but as fixed substring, and can boost search time
 	PseudoGTIDMonotonicHint                    string            // subtring in Pseudo-GTID entry which indicates Pseudo-GTID entries are expected to be monotonically increasing
 	DetectPseudoGTIDQuery                      string            // Optional query which is used to authoritatively decide whether pseudo gtid is enabled on instance
-	PseudoGTIDPreferIndependentMultiMatch      bool              // if 'false', a multi-replica Pseudo-GTID operation will attempt grouping replicas via Pseudo-GTID, and make less binlog computations. However it may cause servers in same bucket wait for one another, which could delay some servers from being repointed. There is a tradeoff between total operation time for all servers, and per-server time. When 'true', Pseudo-GTID matching will operate per server, independently. This will cause waste of same calculations, but no two servers will wait on one another.
 	BinlogEventsChunkSize                      int               // Chunk size (X) for SHOW BINLOG|RELAYLOG EVENTS LIMIT ?,X statements. Smaller means less locking and mroe work to be done
 	SkipBinlogEventsContaining                 []string          // When scanning/comparing binlogs for Pseudo-GTID, skip entries containing given texts. These are NOT regular expressions (would consume too much CPU while scanning binlogs), just substrings to find.
 	ReduceReplicationAnalysisCount             bool              // When true, replication analysis will only report instances where possibility of handled problems is possible in the first place (e.g. will not report most leaf nodes, that are mostly uninteresting). When false, provides an entry for every known instance
@@ -217,21 +224,25 @@ type Configuration struct {
 	RecoverMasterClusterFilters                []string          // Only do master recovery on clusters matching these regexp patterns (of course the ".*" pattern matches everything)
 	RecoverIntermediateMasterClusterFilters    []string          // Only do IM recovery on clusters matching these regexp patterns (of course the ".*" pattern matches everything)
 	ProcessesShellCommand                      string            // Shell that executes command scripts
-	OnFailureDetectionProcesses                []string          // Processes to execute when detecting a failover scenario (before making a decision whether to failover or not). May and should use some of these placeholders: {failureType}, {failureDescription}, {failedHost}, {failureCluster}, {failureClusterAlias}, {failureClusterDomain}, {failedPort}, {successorHost}, {successorPort}, {successorAlias}, {countReplicas}, {replicaHosts}, {isDowntimed}, {autoMasterRecovery}, {autoIntermediateMasterRecovery}
-	PreFailoverProcesses                       []string          // Processes to execute before doing a failover (aborting operation should any once of them exits with non-zero code; order of execution undefined). May and should use some of these placeholders: {failureType}, {failureDescription}, {failedHost}, {failureCluster}, {failureClusterAlias}, {failureClusterDomain}, {failedPort}, {successorHost}, {successorPort}, {successorAlias}, {countReplicas}, {replicaHosts}, {isDowntimed}
-	PostFailoverProcesses                      []string          // Processes to execute after doing a failover (order of execution undefined). May and should use some of these placeholders: {failureType}, {failureDescription}, {failedHost}, {failureCluster}, {failureClusterAlias}, {failureClusterDomain}, {failedPort}, {successorHost}, {successorPort}, {successorAlias}, {countReplicas}, {replicaHosts}, {isDowntimed}, {isSuccessful}, {lostReplicas}
-	PostUnsuccessfulFailoverProcesses          []string          // Processes to execute after a not-completely-successful failover (order of execution undefined). May and should use some of these placeholders: {failureType}, {failureDescription}, {failedHost}, {failureCluster}, {failureClusterAlias}, {failureClusterDomain}, {failedPort}, {successorHost}, {successorPort}, {successorAlias}, {countReplicas}, {replicaHosts}, {isDowntimed}, {isSuccessful}, {lostReplicas}
+	OnFailureDetectionProcesses                []string          // Processes to execute when detecting a failover scenario (before making a decision whether to failover or not). May and should use some of these placeholders: {failureType}, {failureDescription}, {command}, {failedHost}, {failureCluster}, {failureClusterAlias}, {failureClusterDomain}, {failedPort}, {successorHost}, {successorPort}, {successorAlias}, {countReplicas}, {replicaHosts}, {isDowntimed}, {autoMasterRecovery}, {autoIntermediateMasterRecovery}
+	PreGracefulTakeoverProcesses               []string          // Processes to execute before doing a failover (aborting operation should any once of them exits with non-zero code; order of execution undefined). May and should use some of these placeholders: {failureType}, {failureDescription}, {command}, {failedHost}, {failureCluster}, {failureClusterAlias}, {failureClusterDomain}, {failedPort}, {successorHost}, {successorPort}, {successorAlias}, {countReplicas}, {replicaHosts}, {isDowntimed}
+	PreFailoverProcesses                       []string          // Processes to execute before doing a failover (aborting operation should any once of them exits with non-zero code; order of execution undefined). May and should use some of these placeholders: {failureType}, {failureDescription}, {command}, {failedHost}, {failureCluster}, {failureClusterAlias}, {failureClusterDomain}, {failedPort}, {successorHost}, {successorPort}, {successorAlias}, {countReplicas}, {replicaHosts}, {isDowntimed}
+	PostFailoverProcesses                      []string          // Processes to execute after doing a failover (order of execution undefined). May and should use some of these placeholders: {failureType}, {failureDescription}, {command}, {failedHost}, {failureCluster}, {failureClusterAlias}, {failureClusterDomain}, {failedPort}, {successorHost}, {successorPort}, {successorAlias}, {countReplicas}, {replicaHosts}, {isDowntimed}, {isSuccessful}, {lostReplicas}
+	PostUnsuccessfulFailoverProcesses          []string          // Processes to execute after a not-completely-successful failover (order of execution undefined). May and should use some of these placeholders: {failureType}, {failureDescription}, {command}, {failedHost}, {failureCluster}, {failureClusterAlias}, {failureClusterDomain}, {failedPort}, {successorHost}, {successorPort}, {successorAlias}, {countReplicas}, {replicaHosts}, {isDowntimed}, {isSuccessful}, {lostReplicas}
 	PostMasterFailoverProcesses                []string          // Processes to execute after doing a master failover (order of execution undefined). Uses same placeholders as PostFailoverProcesses
 	PostIntermediateMasterFailoverProcesses    []string          // Processes to execute after doing a master failover (order of execution undefined). Uses same placeholders as PostFailoverProcesses
-	UnreachableMasterWithStaleSlavesProcesses  []string          // Processes to execute when detecting an UnreachableMasterWithStaleSlaves scenario.
+	PostGracefulTakeoverProcesses              []string          // Processes to execute after runnign a graceful master takeover. Uses same placeholders as PostFailoverProcesses
+	PostTakeMasterProcesses                    []string          // Processes to execute after a successful Take-Master event has taken place
 	CoMasterRecoveryMustPromoteOtherCoMaster   bool              // When 'false', anything can get promoted (and candidates are prefered over others). When 'true', orchestrator will promote the other co-master or else fail
 	DetachLostSlavesAfterMasterFailover        bool              // synonym to DetachLostReplicasAfterMasterFailover
 	DetachLostReplicasAfterMasterFailover      bool              // Should replicas that are not to be lost in master recovery (i.e. were more up-to-date than promoted replica) be forcibly detached
 	ApplyMySQLPromotionAfterMasterFailover     bool              // Should orchestrator take upon itself to apply MySQL master promotion: set read_only=0, detach replication, etc.
+	PreventCrossDataCenterMasterFailover       bool              // When true (default: false), cross-DC master failover are not allowed, orchestrator will do all it can to only fail over within same DC, or else not fail over at all.
 	MasterFailoverLostInstancesDowntimeMinutes uint              // Number of minutes to downtime any server that was lost after a master failover (including failed master & lost replicas). 0 to disable
 	MasterFailoverDetachSlaveMasterHost        bool              // synonym to MasterFailoverDetachReplicaMasterHost
 	MasterFailoverDetachReplicaMasterHost      bool              // Should orchestrator issue a detach-replica-master-host on newly promoted master (this makes sure the new master will not attempt to replicate old master if that comes back to life). Defaults 'false'. Meaningless if ApplyMySQLPromotionAfterMasterFailover is 'true'.
 	FailMasterPromotionIfSQLThreadNotUpToDate  bool              // when true, and a master failover takes place, if candidate master has not consumed all relay logs, promotion is aborted with error
+	DelayMasterPromotionIfSQLThreadNotUpToDate bool              // when true, and a master failover takes place, if candidate master has not consumed all relay logs, delay promotion until the sql thread has caught up
 	PostponeSlaveRecoveryOnLagMinutes          uint              // Synonym to PostponeReplicaRecoveryOnLagMinutes
 	PostponeReplicaRecoveryOnLagMinutes        uint              // On crash recovery, replicas that are lagging more than given minutes are only resurrected late in the recovery process, after master/IM has been elected and processes executed. Value of 0 disables this feature
 	RemoteSSHForMasterFailover                 bool              // Should orchestrator attempt a remote-ssh relaylog-synching upon master failover? Requires RemoteSSHCommand
@@ -243,11 +254,13 @@ type Configuration struct {
 	GraphiteConvertHostnameDotsToUnderscores   bool              // If true, then hostname's dots are converted to underscores before being used in graphite path
 	GraphitePollSeconds                        int               // Graphite writes interval. 0 disables.
 	URLPrefix                                  string            // URL prefix to run orchestrator on non-root web path, e.g. /orchestrator to put it behind nginx.
-	MaxOutdatedKeysToShow                      int               // Maximum number of keys to show in ContinuousDiscovery. If the number of polled hosts grows too far then showing the complete list is not ideal.
 	DiscoveryIgnoreReplicaHostnameFilters      []string          // Regexp filters to apply to prevent auto-discovering new replicas. Usage: unreachable servers due to firewalls, applications which trigger binlog dumps
 	ConsulAddress                              string            // Address where Consul HTTP api is found. Example: 127.0.0.1:8500
+	ConsulAclToken                             string            // ACL token used to write to Consul KV
+	ConsulCrossDataCenterDistribution          bool              // should orchestrator automatically auto-deduce all consul DCs and write KVs in all DCs
 	ZkAddress                                  string            // UNSUPPERTED YET. Address where (single or multiple) ZooKeeper servers are found, in `srv1[:port1][,srv2[:port2]...]` format. Default port is 2181. Example: srv-a,srv-b:12181,srv-c
 	KVClusterMasterPrefix                      string            // Prefix to use for clusters' masters entries in KV stores (internal, consul, ZK), default: "mysql/master"
+	WebMessage                                 string            // If provided, will be shown on all web pages below the title bar
 }
 
 // ToJSONString will marshal this configuration as JSON
@@ -266,6 +279,7 @@ func newConfiguration() *Configuration {
 		EnableSyslog:                               false,
 		ListenAddress:                              ":3000",
 		ListenSocket:                               "",
+		HTTPAdvertise:                              "",
 		AgentsServerPort:                           ":3001",
 		StatusEndpoint:                             "/api/status",
 		StatusOUVerify:                             false,
@@ -288,6 +302,7 @@ func newConfiguration() *Configuration {
 		MySQLOrchestratorReadTimeoutSeconds:        30,
 		MySQLDiscoveryReadTimeoutSeconds:           10,
 		MySQLTopologyReadTimeoutSeconds:            600,
+		MySQLConnectionLifetimeSeconds:             0,
 		DefaultInstancePort:                        3306,
 		TLSCacheTTLFactor:                          100,
 		InstancePollSeconds:                        5,
@@ -359,12 +374,12 @@ func newConfiguration() *Configuration {
 		UnseenAgentForgetHours:                     6,
 		StaleSeedFailMinutes:                       60,
 		SeedAcceptableBytesDiff:                    8192,
+		SeedWaitSecondsBeforeSend:                  2,
 		AutoPseudoGTID:                             false,
 		PseudoGTIDPattern:                          "",
 		PseudoGTIDPatternIsFixedSubstring:          false,
 		PseudoGTIDMonotonicHint:                    "",
 		DetectPseudoGTIDQuery:                      "",
-		PseudoGTIDPreferIndependentMultiMatch:      false,
 		BinlogEventsChunkSize:                      10000,
 		SkipBinlogEventsContaining:                 []string{},
 		ReduceReplicationAnalysisCount:             true,
@@ -376,18 +391,22 @@ func newConfiguration() *Configuration {
 		RecoverIntermediateMasterClusterFilters:    []string{},
 		ProcessesShellCommand:                      "bash",
 		OnFailureDetectionProcesses:                []string{},
+		PreGracefulTakeoverProcesses:               []string{},
 		PreFailoverProcesses:                       []string{},
 		PostMasterFailoverProcesses:                []string{},
 		PostIntermediateMasterFailoverProcesses:    []string{},
 		PostFailoverProcesses:                      []string{},
 		PostUnsuccessfulFailoverProcesses:          []string{},
-		UnreachableMasterWithStaleSlavesProcesses:  []string{},
+		PostGracefulTakeoverProcesses:              []string{},
+		PostTakeMasterProcesses:                    []string{},
 		CoMasterRecoveryMustPromoteOtherCoMaster:   true,
 		DetachLostSlavesAfterMasterFailover:        true,
-		ApplyMySQLPromotionAfterMasterFailover:     false,
+		ApplyMySQLPromotionAfterMasterFailover:     true,
+		PreventCrossDataCenterMasterFailover:       false,
 		MasterFailoverLostInstancesDowntimeMinutes: 0,
 		MasterFailoverDetachSlaveMasterHost:        false,
 		FailMasterPromotionIfSQLThreadNotUpToDate:  false,
+		DelayMasterPromotionIfSQLThreadNotUpToDate: false,
 		PostponeSlaveRecoveryOnLagMinutes:          0,
 		RemoteSSHForMasterFailover:                 false,
 		RemoteSSHCommand:                           "",
@@ -398,11 +417,13 @@ func newConfiguration() *Configuration {
 		GraphiteConvertHostnameDotsToUnderscores:   true,
 		GraphitePollSeconds:                        60,
 		URLPrefix:                                  "",
-		MaxOutdatedKeysToShow:                      64,
-		DiscoveryIgnoreReplicaHostnameFilters:      []string{},
-		ConsulAddress:                              "",
-		ZkAddress:                                  "",
-		KVClusterMasterPrefix:                      "mysql/master",
+		DiscoveryIgnoreReplicaHostnameFilters: []string{},
+		ConsulAddress:                         "",
+		ConsulAclToken:                        "",
+		ConsulCrossDataCenterDistribution:     false,
+		ZkAddress:                             "",
+		KVClusterMasterPrefix:                 "mysql/master",
+		WebMessage:                            "",
 	}
 }
 
@@ -486,7 +507,9 @@ func (this *Configuration) postReadAdjustments() error {
 			this.MasterFailoverDetachReplicaMasterHost = true
 		}
 	}
-
+	if this.FailMasterPromotionIfSQLThreadNotUpToDate && this.DelayMasterPromotionIfSQLThreadNotUpToDate {
+		return fmt.Errorf("Cannot have both FailMasterPromotionIfSQLThreadNotUpToDate and DelayMasterPromotionIfSQLThreadNotUpToDate enabled")
+	}
 	{
 		if this.PostponeReplicaRecoveryOnLagMinutes != 0 && this.PostponeSlaveRecoveryOnLagMinutes != 0 &&
 			this.PostponeReplicaRecoveryOnLagMinutes != this.PostponeSlaveRecoveryOnLagMinutes {
@@ -519,11 +542,14 @@ func (this *Configuration) postReadAdjustments() error {
 	if this.RemoteSSHForMasterFailover && this.RemoteSSHCommand == "" {
 		return fmt.Errorf("RemoteSSHCommand is required when RemoteSSHForMasterFailover is set")
 	}
-	if this.RaftAdvertise == "" {
-		this.RaftAdvertise = this.RaftBind
-	}
 	if this.RaftEnabled && this.RaftDataDir == "" {
 		return fmt.Errorf("RaftDataDir must be defined since raft is enabled (RaftEnabled)")
+	}
+	if this.RaftEnabled && this.RaftBind == "" {
+		return fmt.Errorf("RaftBind must be defined since raft is enabled (RaftEnabled)")
+	}
+	if this.RaftAdvertise == "" {
+		this.RaftAdvertise = this.RaftBind
 	}
 	if this.KVClusterMasterPrefix != "/" {
 		// "/" remains "/"
@@ -532,15 +558,29 @@ func (this *Configuration) postReadAdjustments() error {
 		this.KVClusterMasterPrefix = strings.TrimRight(this.KVClusterMasterPrefix, "/")
 		this.KVClusterMasterPrefix = fmt.Sprintf("%s/", this.KVClusterMasterPrefix)
 	}
-	if this.ZkAddress != "" {
-		return fmt.Errorf("ZkAddress (ZooKeeper) configuration is unsupported yet")
-	}
 	if this.AutoPseudoGTID {
 		this.PseudoGTIDPattern = "drop view if exists `_pseudo_gtid_`"
 		this.PseudoGTIDPatternIsFixedSubstring = true
 		this.PseudoGTIDMonotonicHint = "asc:"
 		this.DetectPseudoGTIDQuery = SelectTrueQuery
-		this.PseudoGTIDPreferIndependentMultiMatch = true
+	}
+	if this.HTTPAdvertise != "" {
+		u, err := url.Parse(this.HTTPAdvertise)
+		if err != nil {
+			return fmt.Errorf("Failed parsing HTTPAdvertise %s: %s", this.HTTPAdvertise, err.Error())
+		}
+		if u.Scheme == "" {
+			return fmt.Errorf("If specified, HTTPAdvertise must include scheme (http:// or https://)")
+		}
+		if u.Hostname() == "" {
+			return fmt.Errorf("If specified, HTTPAdvertise must include host name")
+		}
+		if u.Port() == "" {
+			return fmt.Errorf("If specified, HTTPAdvertise must include port number")
+		}
+		if u.Path != "" {
+			return fmt.Errorf("If specified, HTTPAdvertise must not specify a path")
+		}
 	}
 	return nil
 }

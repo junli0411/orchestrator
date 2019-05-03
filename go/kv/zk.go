@@ -16,22 +16,70 @@
 
 package kv
 
+import (
+	"fmt"
+	"math/rand"
+	"strings"
+	"time"
+
+	"github.com/github/orchestrator/go/config"
+	"github.com/outbrain/zookeepercli/zk"
+	zkconstants "github.com/samuel/go-zookeeper/zk"
+)
+
 // Internal key-value store, based on relational backend
 type zkStore struct {
+	zook *zk.ZooKeeper
 }
 
-// TODO: use config.Config.ZkAddress to put/get k/v in ZooKeeper. See
-// - https://github.com/outbrain/zookeepercli
-// - https://github.com/samuel/go-zookeeper/zk
+func normalizeKey(key string) (normalizedKey string) {
+	normalizedKey = strings.TrimLeft(key, "/")
+	normalizedKey = fmt.Sprintf("/%s", normalizedKey)
+	return normalizedKey
+}
 
 func NewZkStore() KVStore {
-	return &zkStore{}
+	store := &zkStore{}
+
+	if config.Config.ZkAddress != "" {
+		rand.Seed(time.Now().UnixNano())
+
+		serversArray := strings.Split(config.Config.ZkAddress, ",")
+		zook := zk.NewZooKeeper()
+		zook.SetServers(serversArray)
+		store.zook = zook
+	}
+	return store
 }
 
 func (this *zkStore) PutKeyValue(key string, value string) (err error) {
-	return
+	if this.zook == nil {
+		return nil
+	}
+
+	if _, err = this.zook.Set(normalizeKey(key), []byte(value)); err == zkconstants.ErrNoNode {
+		aclstr := ""
+		_, err = this.zook.Create(normalizeKey(key), []byte(value), aclstr, true)
+	}
+	return err
 }
 
-func (this *zkStore) GetKeyValue(key string) (value string, err error) {
-	return
+func (this *zkStore) GetKeyValue(key string) (value string, found bool, err error) {
+	if this.zook == nil {
+		return value, false, nil
+	}
+	result, err := this.zook.Get(normalizeKey(key))
+	if err != nil {
+		return value, false, err
+	}
+	return string(result), true, nil
+}
+
+func (this *zkStore) AddKeyValue(key string, value string) (added bool, err error) {
+	err = this.PutKeyValue(key, value)
+	return (err != nil), err
+}
+
+func (this *zkStore) DistributePairs(pairs [](*KVPair)) (err error) {
+	return nil
 }

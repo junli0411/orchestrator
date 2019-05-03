@@ -36,21 +36,28 @@ func (this *KVPair) String() string {
 
 type KVStore interface {
 	PutKeyValue(key string, value string) (err error)
-	GetKeyValue(key string) (value string, err error)
+	GetKeyValue(key string) (value string, found bool, err error)
+	AddKeyValue(key string, value string) (added bool, err error)
+	DistributePairs(pairs [](*KVPair)) (err error)
 }
 
 var kvMutex sync.Mutex
+var kvInitOnce sync.Once
 var kvStores = []KVStore{}
 
+// InitKVStores initializes the KV stores (duh), once in the lifetime of this app.
+// Configuration reload does not affect a running instance.
 func InitKVStores() {
 	kvMutex.Lock()
 	defer kvMutex.Unlock()
 
-	kvStores = []KVStore{
-		NewInternalKVStore(),
-		NewConsulStore(),
-		NewZkStore(),
-	}
+	kvInitOnce.Do(func() {
+		kvStores = []KVStore{
+			NewInternalKVStore(),
+			NewConsulStore(),
+			NewZkStore(),
+		}
+	})
 }
 
 func getKVStores() (stores []KVStore) {
@@ -61,12 +68,12 @@ func getKVStores() (stores []KVStore) {
 	return stores
 }
 
-func GetValue(key string) (value string, err error) {
+func GetValue(key string) (value string, found bool, err error) {
 	for _, store := range getKVStores() {
 		// It's really only the first (internal) that matters here
 		return store.GetKeyValue(key)
 	}
-	return value, err
+	return value, found, err
 }
 
 func PutValue(key string, value string) (err error) {
@@ -83,4 +90,33 @@ func PutKVPair(kvPair *KVPair) (err error) {
 		return nil
 	}
 	return PutValue(kvPair.Key, kvPair.Value)
+}
+
+func AddValue(key string, value string) (err error) {
+	for _, store := range getKVStores() {
+		added, err := store.AddKeyValue(key, value)
+		if err != nil {
+			return err
+		}
+		if !added {
+			return nil
+		}
+	}
+	return nil
+}
+
+func AddKVPair(kvPair *KVPair) (err error) {
+	if kvPair == nil {
+		return nil
+	}
+	return AddValue(kvPair.Key, kvPair.Value)
+}
+
+func DistributePairs(pairs [](*KVPair)) (err error) {
+	for _, store := range getKVStores() {
+		if err := store.DistributePairs(pairs); err != nil {
+			return err
+		}
+	}
+	return nil
 }

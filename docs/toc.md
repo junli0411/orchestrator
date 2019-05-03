@@ -16,6 +16,7 @@
 - [Using the web interface](using-the-web-interface.md)
 - [Using the web API](using-the-web-api.md): achieving automation via HTTP GET requests
 - [Using orchestrator-client](orchestrator-client.md): a no binary/config needed script that wraps API calls
+- [Scripting samples](script-samples.md)
 
 #### Deployment
 - [High availability](high-availability.md): making `orchestrator` highly available
@@ -28,11 +29,14 @@
 - [Topology recovery](topology-recovery.md): recovery process, promotion and hooks.
 - [Key-Value stores](kv.md): master discovery for your apps
 
+#### Operation
+- [Status Checks](status-checks.md)
+- [Tags](tags.md)
+
 #### Various
 - [Docker](docker.md)
 - [Security](security.md)
 - [SSL and TLS](ssl-and-tls.md)
-- [Status Checks](status-checks.md)
 - [Pseudo GTID](pseudo-gtid.md): refactoring and high availability without using GTID.
 - [Agents](agents.md)
 

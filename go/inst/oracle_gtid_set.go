@@ -28,7 +28,7 @@ type OracleGtidSet struct {
 // Example input:  `230ea8ea-81e3-11e4-972a-e25ec4bd140a:1-10539,
 // 316d193c-70e5-11e5-adb2-ecf4bb2262ff:1-8935:8984-6124596,
 // 321f5c0d-70e5-11e5-adb2-ecf4bb2262ff:1-56`
-func ParseGtidSet(gtidSet string) (res *OracleGtidSet, err error) {
+func NewOracleGtidSet(gtidSet string) (res *OracleGtidSet, err error) {
 	res = &OracleGtidSet{}
 
 	gtidSet = strings.TrimSpace(gtidSet)
@@ -37,6 +37,10 @@ func ParseGtidSet(gtidSet string) (res *OracleGtidSet, err error) {
 	}
 	entries := strings.Split(gtidSet, ",")
 	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
 		if gtidRange, err := NewOracleGtidSetEntry(entry); err == nil {
 			res.GtidEntries = append(res.GtidEntries, gtidRange)
 		} else {
@@ -64,10 +68,61 @@ func (this *OracleGtidSet) RemoveUUID(uuid string) (removed bool) {
 	return removed
 }
 
-func (this OracleGtidSet) String() string {
+// RetainUUID retains only entries that belong to given UUID.
+func (this *OracleGtidSet) RetainUUID(uuid string) (anythingRemoved bool) {
+	return this.RetainUUIDs([]string{uuid})
+}
+
+// RetainUUIDs retains only entries that belong to given UUIDs.
+func (this *OracleGtidSet) RetainUUIDs(uuids []string) (anythingRemoved bool) {
+	retainUUIDs := map[string]bool{}
+	for _, uuid := range uuids {
+		retainUUIDs[uuid] = true
+	}
+	filteredEntries := [](*OracleGtidSetEntry){}
+	for _, entry := range this.GtidEntries {
+		if retainUUIDs[entry.UUID] {
+			filteredEntries = append(filteredEntries, entry)
+		} else {
+			anythingRemoved = true
+		}
+	}
+	if anythingRemoved {
+		this.GtidEntries = filteredEntries
+	}
+	return anythingRemoved
+}
+
+// SharedUUIDs returns UUIDs (range-less) that are shared between the two sets
+func (this *OracleGtidSet) SharedUUIDs(other *OracleGtidSet) (shared []string) {
+	thisUUIDs := map[string]bool{}
+	for _, entry := range this.GtidEntries {
+		thisUUIDs[entry.UUID] = true
+	}
+	for _, entry := range other.GtidEntries {
+		if thisUUIDs[entry.UUID] {
+			shared = append(shared, entry.UUID)
+		}
+	}
+	return shared
+}
+
+// String returns a user-friendly string representation of this entry
+func (this *OracleGtidSet) Explode() (result [](*OracleGtidSetEntry)) {
+	for _, entries := range this.GtidEntries {
+		result = append(result, entries.Explode()...)
+	}
+	return result
+}
+
+func (this *OracleGtidSet) String() string {
 	tokens := []string{}
 	for _, entry := range this.GtidEntries {
 		tokens = append(tokens, entry.String())
 	}
-	return strings.Join(tokens, ",\n")
+	return strings.Join(tokens, ",")
+}
+
+func (this *OracleGtidSet) IsEmpty() bool {
+	return len(this.GtidEntries) == 0
 }

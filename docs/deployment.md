@@ -103,7 +103,7 @@ If you're not using GTID, you'll be happy to know `orchestrator` can utilize Pse
 
 Read more on the [Pseudo-GTID](pseudo-gtid.md) documentation page.
 
-`orchestrator` can inject Pseudo-GTID entires for you. Your clusters will magically have GTID-like superpowers. Follow [Automated Pseudo-GTID](configuration-discovery-pseudo-gtid.md#automated-pseudo-gtid-injection)
+`orchestrator` can inject Pseudo-GTID entries for you. Your clusters will magically have GTID-like superpowers. Follow [Automated Pseudo-GTID](configuration-discovery-pseudo-gtid.md#automated-pseudo-gtid-injection)
 
 ### Populating meta data
 
@@ -138,3 +138,10 @@ and populate this table, with, say `1, my_cluster_name`, coupled with:
   "DetectClusterAliasQuery": "select cluster_name from meta.cluster where anchor=1"
 }
 ```
+
+Please note `orchestrator` does not create such tables nor does it populate them.
+You will need to create the table, populate them, and let `orchestrator` know how to query the data.
+
+### Tagging
+
+`orchestrator` supports tagging of instances, as well as searching for instances by tags. See [Tags](tags.md)

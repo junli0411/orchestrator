@@ -21,10 +21,13 @@ Clone the repo anywhere on your filesystem via
 	git clone git@github.com:github/orchestrator.git
 	cd orchestrator
 
-Build `orchestrator` via
+Ensure you have proper build tools installed (CentOS referenced below)
+
+    yum install gcc make perl-Digest-SHA
+
+Then you can build `orchestrator` via
 
 	script/build
-
 
 You will find the binary as `bin/orchestrator`
 
@@ -71,8 +74,8 @@ No special setup is required. Make sure to configure database file path.
 Once your backend MySQL setup is complete, issue:
 
     CREATE DATABASE IF NOT EXISTS orchestrator;
-    GRANT ALL PRIVILEGES ON `orchestrator`.* TO 'orchestrator'@'127.0.0.1'
-    IDENTIFIED BY 'orch_backend_password';
+    CREATE USER 'orc_server_user'@'%' IDENTIFIED BY 'orc_server_password';
+    GRANT ALL PRIVILEGES ON `orchestrator`.* TO 'orc_server_user'@'%';
 
 `orchestrator` uses a configuration file whose search path is either `/etc/orchestrator.conf.json`,  `conf/orchestrator.conf.json` or `orchestrator.conf.json`.
 The repository includes a file called `conf/orchestrator-sample.conf.json` with some basic settings. Issue:
@@ -81,14 +84,14 @@ The repository includes a file called `conf/orchestrator-sample.conf.json` with 
 
 The `conf/orchestrator.conf.json` file is not part of the repository and there is in fact a `.gitignore` entry for this file.
 
-Edit `orchestrator.conf.json` to match the above as follows:
+Verify `orchestrator.conf.json` matches the above as follows:
 
     ...
     "MySQLOrchestratorHost": "127.0.0.1",
     "MySQLOrchestratorPort": 3306,
     "MySQLOrchestratorDatabase": "orchestrator",
-    "MySQLOrchestratorUser": "orchestrator",
-    "MySQLOrchestratorPassword": "orch_backend_password",
+    "MySQLOrchestratorUser": "orc_server_user",
+    "MySQLOrchestratorPassword": "orc_server_password",
     ...
 
 Edit the above as as fit for your MySQL backend install.
@@ -114,8 +117,8 @@ Now to make stuff interesting.
 For `orchestrator` to detect your replication topologies, it must also have an account on each and every topology. At this stage this has to be the
 same account (same user, same password) for all topologies. On each of your masters, issue the following:
 
-    GRANT SUPER, PROCESS, REPLICATION SLAVE, RELOAD ON *.*
-    TO 'orchestrator'@'orch_host' IDENTIFIED BY 'orch_topology_password';
+    CREATE USER 'orchestrator'@'orch_host' IDENTIFIED BY 'orch_topology_password';
+    GRANT SUPER, PROCESS, REPLICATION SLAVE, RELOAD ON *.* TO 'orchestrator'@'orch_host';
 
 > REPLICATION SLAVE is required if you intend to use [Pseudo GTID](#pseudo-gtid)
 

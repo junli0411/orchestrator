@@ -77,8 +77,18 @@ func (applier *CommandApplier) ApplyCommand(op string, value []byte) interface{}
 		return applier.enableGlobalRecoveries(value)
 	case "put-key-value":
 		return applier.putKeyValue(value)
+	case "add-key-value":
+		return applier.addKeyValue(value)
+	case "put-instance-tag":
+		return applier.putInstanceTag(value)
+	case "delete-instance-tag":
+		return applier.deleteInstanceTag(value)
 	case "leader-uri":
 		return applier.leaderURI(value)
+	case "request-health-report":
+		return applier.healthReport(value)
+	case "set-cluster-alias-manual-override":
+		return applier.setClusterAliasManualOverride(value)
 	}
 	return log.Errorf("Unknown command op: %s", op)
 }
@@ -97,7 +107,7 @@ func (applier *CommandApplier) discover(value []byte) interface{} {
 	if err := json.Unmarshal(value, &instanceKey); err != nil {
 		return log.Errore(err)
 	}
-	discoverInstance(instanceKey)
+	DiscoverInstance(instanceKey)
 	return nil
 }
 
@@ -160,6 +170,9 @@ func (applier *CommandApplier) ackRecovery(value []byte) interface{} {
 	err := json.Unmarshal(value, &ack)
 	if err != nil {
 		return log.Errore(err)
+	}
+	if ack.AllRecoveries {
+		_, err = AcknowledgeAllRecoveries(ack.Owner, ack.Comment)
 	}
 	if ack.ClusterName != "" {
 		_, err = AcknowledgeClusterRecoveries(ack.ClusterName, ack.Owner, ack.Comment)
@@ -253,6 +266,34 @@ func (applier *CommandApplier) putKeyValue(value []byte) interface{} {
 	return err
 }
 
+func (applier *CommandApplier) addKeyValue(value []byte) interface{} {
+	kvPair := kv.KVPair{}
+	if err := json.Unmarshal(value, &kvPair); err != nil {
+		return log.Errore(err)
+	}
+	err := kv.AddKVPair(&kvPair)
+
+	return err
+}
+
+func (applier *CommandApplier) putInstanceTag(value []byte) interface{} {
+	instanceTag := inst.InstanceTag{}
+	if err := json.Unmarshal(value, &instanceTag); err != nil {
+		return log.Errore(err)
+	}
+	err := inst.PutInstanceTag(&instanceTag.Key, &instanceTag.T)
+	return err
+}
+
+func (applier *CommandApplier) deleteInstanceTag(value []byte) interface{} {
+	instanceTag := inst.InstanceTag{}
+	if err := json.Unmarshal(value, &instanceTag); err != nil {
+		return log.Errore(err)
+	}
+	_, err := inst.Untag(&instanceTag.Key, &instanceTag.T)
+	return err
+}
+
 func (applier *CommandApplier) leaderURI(value []byte) interface{} {
 	var uri string
 	if err := json.Unmarshal(value, &uri); err != nil {
@@ -260,4 +301,23 @@ func (applier *CommandApplier) leaderURI(value []byte) interface{} {
 	}
 	orcraft.LeaderURI.Set(uri)
 	return nil
+}
+
+func (applier *CommandApplier) healthReport(value []byte) interface{} {
+	var authenticationToken string
+	if err := json.Unmarshal(value, &authenticationToken); err != nil {
+		return log.Errore(err)
+	}
+	orcraft.ReportToRaftLeader(authenticationToken)
+	return nil
+}
+
+func (applier *CommandApplier) setClusterAliasManualOverride(value []byte) interface{} {
+	var params [2]string
+	if err := json.Unmarshal(value, &params); err != nil {
+		return log.Errore(err)
+	}
+	clusterName, alias := params[0], params[1]
+	err := inst.SetClusterAliasManualOverride(clusterName, alias)
+	return err
 }

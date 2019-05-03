@@ -25,6 +25,7 @@ import (
 	"github.com/github/orchestrator/go/inst"
 	"github.com/github/orchestrator/go/process"
 	"github.com/github/orchestrator/go/raft"
+	"github.com/github/orchestrator/go/util"
 	"github.com/openark/golib/log"
 	"github.com/openark/golib/sqlutils"
 )
@@ -35,7 +36,7 @@ func AttemptFailureDetectionRegistration(analysisEntry *inst.ReplicationAnalysis
 		analysisEntry.AnalyzedInstanceKey.Hostname,
 		analysisEntry.AnalyzedInstanceKey.Port,
 		process.ThisHostname,
-		process.ProcessToken.Hash,
+		util.ProcessToken.Hash,
 		string(analysisEntry.Analysis),
 		analysisEntry.ClusterDetails.ClusterName,
 		analysisEntry.ClusterDetails.ClusterAlias,
@@ -177,7 +178,7 @@ func writeTopologyRecovery(topologyRecovery *TopologyRecovery) (*TopologyRecover
 		sqlutils.NilIfZero(topologyRecovery.Id),
 		topologyRecovery.UID,
 		analysisEntry.AnalyzedInstanceKey.Hostname, analysisEntry.AnalyzedInstanceKey.Port,
-		process.ThisHostname, process.ProcessToken.Hash,
+		process.ThisHostname, util.ProcessToken.Hash,
 		string(analysisEntry.Analysis),
 		analysisEntry.ClusterDetails.ClusterName,
 		analysisEntry.ClusterDetails.ClusterAlias,
@@ -242,8 +243,7 @@ func AttemptRecoveryRegistration(analysisEntry *inst.ReplicationAnalysis, failIf
 		return nil, log.Errore(err)
 	}
 	if orcraft.IsRaftEnabled() {
-		_, err := orcraft.PublishCommand("write-recovery", topologyRecovery)
-		if err != nil {
+		if _, err := orcraft.PublishCommand("write-recovery", topologyRecovery); err != nil {
 			return nil, log.Errore(err)
 		}
 	}
@@ -390,6 +390,12 @@ func acknowledgeRecoveries(owner string, comment string, markEndRecovery bool, w
 	return rows, log.Errore(err)
 }
 
+// AcknowledgeAllRecoveries acknowledges all unacknowledged recoveries.
+func AcknowledgeAllRecoveries(owner string, comment string) (countAcknowledgedEntries int64, err error) {
+	whereClause := `1 = 1`
+	return acknowledgeRecoveries(owner, comment, false, whereClause, sqlutils.Args())
+}
+
 // AcknowledgeRecovery acknowledges a particular recovery.
 // This also implied clearing their active period, which in turn enables further recoveries on those topologies
 func AcknowledgeRecovery(recoveryId int64, owner string, comment string) (countAcknowledgedEntries int64, err error) {
@@ -495,7 +501,7 @@ func writeResolveRecovery(topologyRecovery *TopologyRecovery) error {
 	return log.Errore(err)
 }
 
-// readRecoveries reads recovery entry/audit entires from topology_recovery
+// readRecoveries reads recovery entry/audit entries from topology_recovery
 func readRecoveries(whereCondition string, limit string, args []interface{}) ([]TopologyRecovery, error) {
 	res := []TopologyRecovery{}
 	query := fmt.Sprintf(`
@@ -579,7 +585,7 @@ func readRecoveries(whereCondition string, limit string, args []interface{}) ([]
 	return res, log.Errore(err)
 }
 
-// ReadActiveRecoveries reads active recovery entry/audit entires from topology_recovery
+// ReadActiveRecoveries reads active recovery entry/audit entries from topology_recovery
 func ReadActiveClusterRecovery(clusterName string) ([]TopologyRecovery, error) {
 	whereClause := `
 		where
@@ -637,7 +643,7 @@ func ReadRecentlyActiveInstanceRecovery(instanceKey *inst.InstanceKey) ([]Topolo
 	return readRecoveries(whereClause, ``, sqlutils.Args(instanceKey.Hostname, instanceKey.Port))
 }
 
-// ReadActiveRecoveries reads active recovery entry/audit entires from topology_recovery
+// ReadActiveRecoveries reads active recovery entry/audit entries from topology_recovery
 func ReadActiveRecoveries() ([]TopologyRecovery, error) {
 	return readRecoveries(`
 		where
@@ -646,7 +652,7 @@ func ReadActiveRecoveries() ([]TopologyRecovery, error) {
 		``, sqlutils.Args())
 }
 
-// ReadCompletedRecoveries reads completed recovery entry/audit entires from topology_recovery
+// ReadCompletedRecoveries reads completed recovery entry/audit entries from topology_recovery
 func ReadCompletedRecoveries(page int) ([]TopologyRecovery, error) {
 	limit := `
 		limit ?
@@ -654,13 +660,13 @@ func ReadCompletedRecoveries(page int) ([]TopologyRecovery, error) {
 	return readRecoveries(`where end_recovery is not null`, limit, sqlutils.Args(config.AuditPageSize, page*config.AuditPageSize))
 }
 
-// ReadRecovery reads completed recovery entry/audit entires from topology_recovery
+// ReadRecovery reads completed recovery entry/audit entries from topology_recovery
 func ReadRecovery(recoveryId int64) ([]TopologyRecovery, error) {
 	whereClause := `where recovery_id = ?`
 	return readRecoveries(whereClause, ``, sqlutils.Args(recoveryId))
 }
 
-// ReadRecoveryByUID reads completed recovery entry/audit entires from topology_recovery
+// ReadRecoveryByUID reads completed recovery entry/audit entries from topology_recovery
 func ReadRecoveryByUID(recoveryUID string) ([]TopologyRecovery, error) {
 	whereClause := `where uid = ?`
 	return readRecoveries(whereClause, ``, sqlutils.Args(recoveryUID))
@@ -688,7 +694,7 @@ func ReadRecentRecoveries(clusterName string, unacknowledgedOnly bool, page int)
 	return readRecoveries(whereClause, limit, args)
 }
 
-// readRecoveries reads recovery entry/audit entires from topology_recovery
+// readRecoveries reads recovery entry/audit entries from topology_recovery
 func readFailureDetections(whereCondition string, limit string, args []interface{}) ([]TopologyRecovery, error) {
 	res := []TopologyRecovery{}
 	query := fmt.Sprintf(`

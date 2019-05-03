@@ -35,6 +35,7 @@ import (
 	ometrics "github.com/github/orchestrator/go/metrics"
 	"github.com/github/orchestrator/go/process"
 	"github.com/github/orchestrator/go/raft"
+	"github.com/github/orchestrator/go/util"
 	"github.com/openark/golib/log"
 	"github.com/patrickmn/go-cache"
 	"github.com/rcrowley/go-metrics"
@@ -69,6 +70,7 @@ var isElectedNode int64 = 0
 
 var recentDiscoveryOperationKeys *cache.Cache
 var pseudoGTIDPublishCache = cache.New(time.Minute, time.Second)
+var kvFoundCache = cache.New(10*time.Minute, time.Minute)
 
 func init() {
 	snapshotDiscoveryKeys = make(chan inst.InstanceKey, 10)
@@ -173,17 +175,17 @@ func handleDiscoveryRequests() {
 					continue
 				}
 
-				discoverInstance(instanceKey)
+				DiscoverInstance(instanceKey)
 				discoveryQueue.Release(instanceKey)
 			}
 		}()
 	}
 }
 
-// discoverInstance will attempt to discover (poll) an instance (unless
+// DiscoverInstance will attempt to discover (poll) an instance (unless
 // it is already up to date) and will also ensure that its master and
 // replicas (if any) are also checked.
-func discoverInstance(instanceKey inst.InstanceKey) {
+func DiscoverInstance(instanceKey inst.InstanceKey) {
 	if inst.InstanceIsForgotten(&instanceKey) {
 		log.Debugf("discoverInstance: skipping discovery of %+v because it is set to be forgotten", instanceKey)
 		return
@@ -205,7 +207,7 @@ func discoverInstance(instanceKey inst.InstanceKey) {
 		}
 	}()
 
-	instanceKey.Formalize()
+	instanceKey.ResolveHostname()
 	if !instanceKey.IsValid() {
 		return
 	}
@@ -246,12 +248,14 @@ func discoverInstance(instanceKey inst.InstanceKey) {
 			InstanceLatency: instanceLatency,
 			Err:             err,
 		})
-		log.Warningf("discoverInstance(%+v) instance is nil in %.3fs (Backend: %.3fs, Instance: %.3fs), error=%+v",
-			instanceKey,
-			totalLatency.Seconds(),
-			backendLatency.Seconds(),
-			instanceLatency.Seconds(),
-			err)
+		if util.ClearToLog("discoverInstance", instanceKey.StringCode()) {
+			log.Warningf(" DiscoverInstance(%+v) instance is nil in %.3fs (Backend: %.3fs, Instance: %.3fs), error=%+v",
+				instanceKey,
+				totalLatency.Seconds(),
+				backendLatency.Seconds(),
+				instanceLatency.Seconds(),
+				err)
+		}
 		return
 	}
 
@@ -263,13 +267,6 @@ func discoverInstance(instanceKey inst.InstanceKey) {
 		InstanceLatency: instanceLatency,
 		Err:             nil,
 	})
-	log.Debugf("Discovered host: %+v, master: %+v, version: %+v in %.3fs (Backend: %.3fs, Instance: %.3fs)",
-		instance.Key,
-		instance.MasterKey,
-		instance.Version,
-		totalLatency.Seconds(),
-		backendLatency.Seconds(),
-		instanceLatency.Seconds())
 
 	if !IsLeaderOrActive() {
 		// Maybe this node was elected before, but isn't elected anymore.
@@ -359,11 +356,6 @@ func onHealthTick() {
 	}()
 	// avoid any logging unless there's something to be done
 	if len(instanceKeys) > 0 {
-		if len(instanceKeys) > config.Config.MaxOutdatedKeysToShow {
-			log.Debugf("polling %d outdated keys", len(instanceKeys))
-		} else {
-			log.Debugf("outdated keys: %+v", instanceKeys)
-		}
 		for _, instanceKey := range instanceKeys {
 			if instanceKey.IsValid() {
 				discoveryQueue.Push(instanceKey)
@@ -414,6 +406,51 @@ func InjectPseudoGTIDOnWriters() error {
 	return nil
 }
 
+// Write a cluster's master (or all clusters masters) to kv stores.
+// This should generally only happen once in a lifetime of a cluster. Otherwise KV
+// stores are updated via failovers.
+func SubmitMastersToKvStores(clusterName string, force bool) (kvPairs [](*kv.KVPair), submittedCount int, err error) {
+	kvPairs, err = inst.GetMastersKVPairs(clusterName)
+	log.Debugf("kv.SubmitMastersToKvStores, clusterName: %s, force: %+v: numPairs: %+v", clusterName, force, len(kvPairs))
+	if err != nil {
+		return kvPairs, submittedCount, log.Errore(err)
+	}
+	var selectedError error
+	var submitKvPairs [](*kv.KVPair)
+	for _, kvPair := range kvPairs {
+		if !force {
+			// !force: Called periodically to auto-populate KV
+			// We'd like to avoid some overhead.
+			if _, found := kvFoundCache.Get(kvPair.Key); found {
+				// Let's not overload database with queries. Let's not overload raft with events.
+				continue
+			}
+			v, found, err := kv.GetValue(kvPair.Key)
+			if err == nil && found && v == kvPair.Value {
+				// Already has the right value.
+				kvFoundCache.Set(kvPair.Key, true, cache.DefaultExpiration)
+				continue
+			}
+		}
+		submitKvPairs = append(submitKvPairs, kvPair)
+	}
+	log.Debugf("kv.SubmitMastersToKvStores: submitKvPairs: %+v", len(submitKvPairs))
+	for _, kvPair := range submitKvPairs {
+		if orcraft.IsRaftEnabled() {
+			_, err = orcraft.PublishCommand("put-key-value", kvPair)
+		} else {
+			err = kv.PutKVPair(kvPair)
+		}
+		if err == nil {
+			submittedCount++
+		} else {
+			selectedError = err
+		}
+	}
+	kv.DistributePairs(submitKvPairs)
+	return kvPairs, submittedCount, log.Errore(selectedError)
+}
+
 // ContinuousDiscovery starts an asynchronuous infinite discovery process where instances are
 // periodically investigated and their status captured, and long since unseen instances are
 // purged and forgotten.
@@ -436,6 +473,10 @@ func ContinuousDiscovery() {
 	var snapshotTopologiesTick <-chan time.Time
 	if config.Config.SnapshotTopologiesIntervalHours > 0 {
 		snapshotTopologiesTick = time.Tick(time.Duration(config.Config.SnapshotTopologiesIntervalHours) * time.Hour)
+	}
+
+	runCheckAndRecoverOperationsTimeRipe := func() bool {
+		return time.Since(continuousDiscoveryStartTime) >= checkAndRecoverWaitPeriod
 	}
 
 	go ometrics.InitMetrics()
@@ -497,7 +538,6 @@ func ContinuousDiscovery() {
 					go inst.ExpireMasterPositionEquivalence()
 					go inst.ExpirePoolInstances()
 					go inst.FlushNontrivialResolveCacheToDatabase()
-					go inst.ExpireInstanceBinlogFileHistory()
 					go inst.ExpireInjectedPseudoGTID()
 					go process.ExpireNodesHistory()
 					go process.ExpireAccessTokens()
@@ -505,6 +545,10 @@ func ContinuousDiscovery() {
 					go ExpireFailureDetectionHistory()
 					go ExpireTopologyRecoveryHistory()
 					go ExpireTopologyRecoveryStepsHistory()
+
+					if runCheckAndRecoverOperationsTimeRipe() && IsLeader() {
+						go SubmitMastersToKvStores("", false)
+					}
 				} else {
 					// Take this opportunity to refresh yourself
 					go inst.LoadHostnameResolveCache()
@@ -530,7 +574,7 @@ func ContinuousDiscovery() {
 						} else {
 							return
 						}
-						if time.Since(continuousDiscoveryStartTime) >= checkAndRecoverWaitPeriod {
+						if runCheckAndRecoverOperationsTimeRipe() {
 							CheckAndRecover(nil, nil, false)
 						} else {
 							log.Debugf("Waiting for %+v seconds to pass before running failure detection/recovery", checkAndRecoverWaitPeriod.Seconds())

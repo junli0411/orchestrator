@@ -2,7 +2,26 @@
 
 `orchestrator` is able to recover from a set of [failure scenarios](failure-detection.md). Notably, it can recover a failed master or a failed intermediate master.
 
-At this time recovery requires either GTID (Oracle or MariaDB), [Pseudo GTID](#pseudo-gtid) or Binlog Servers.
+## Automated and manual
+
+`orchestrator` supports:
+
+- [Automated recovery](#automated-recovery) (takes action on unexpected failures).
+- [Graceful, planned, master promotion](#graceful-master-promotion).
+- [Manual recovery](#manual-recovery).
+- [Manual, forced/panic failovers](#manual-forced-failover).
+
+## Requirements
+
+To run any kind of failovers, your topologies must support either:
+
+- Oracle GTID (with `MASTER_AUTO_POSITION=1`)
+- MariaDB GTID
+- [Pseudo GTID](pseudo-gtid.md)
+- Binlog Servers
+
+See [MySQL Configuration](configuration-recovery.md#mysql-configuration) for more details.
+
 
 Automated recovery is _opt in_. Please consider [recovery configuration](configuration-recovery.md).
 
@@ -16,7 +35,9 @@ Based on a [failure detection](failure-detection.md), a sequence of events compo
 
 Where:
 
-- Pre-recovery hooks are configured by the user. Failure of any will abort the failover.
+- Pre-recovery hooks are configured by the user.
+  - Executed sequentially
+  - Failure of any of these hooks (nonzero exit code) will abort the failover.
 - Topology healing is managed by `orchestrator` and is state-based rather than configuration-based. `orchestrator` tries to make the best out of a bad situation, taking into consideration the existing topology, versions, server configurations, etc.
 - Post-recovery hooks are, again, configured by the user.
 
@@ -61,44 +82,12 @@ Master service discovery is largely the user's responsibility to implement. Comm
 
 `orchestrator` attempts to be a generic solution hence takes no stance on your service discovery method.
 
-### Web, API, command line
-
-Recoveries are audited via:
-
-- `/web/audit-recovery`
-- `/api/audit-recovery`
-- `/api/audit-recovery-steps/:uid`
-
-Nuance auditing and control available via:
-- `/api/blocked-recoveries`: see blocked recoveries
-- `/api/ack-recovery/cluster/:clusterHint`: acknowledge a recovery on a given cluster
-- `/api/disable-global-recoveries`: global switch to disable `orchestrator` from running any recoveries
-- `/api/enable-global-recoveries`: re-enable recoveries
-- `/api/check-global-recoveries`: check is global recoveries are enabled
-
-Running manual recoveries (see next sections):
-
-- `/api/recover/:host/:port`: recover specific host, assuming `orchestrator` agrees there is failure.
-- `/api/recover-lite/:host/:port`: same, do not invoke external hooks (can be useful for testing)
-- `/api/graceful-master-takeover/:clusterHint`: gracefully promote a new master (planned failover)
-- `/api/force-master-failover/:clusterHint`: panic, force master failover for given cluster
-
-Some corresponding command line invocations:
-
-- `orchestrator-client -c recover -i some.instance:3306`
-- `orchestrator-client -c graceful-master-takeover -i some.instance.in.somecluster:3306`
-- `orchestrator-client -c graceful-master-takeover -alias somecluster`
-- `orchestrator-client -c force-master-takeover -alias somecluster`
-- `orchestrator-client -c ack-cluster-recoveries -alias somecluster`
-- `orchestrator-client -c disable-global-recoveries`
-- `orchestrator-client -c enable-global-recoveries`
-- `orchestrator-client -c check-global-recoveries`
 
 ### Automated recovery
 
 Opt-in. Automated recovery may be applied to all (`"*"`) clusters or specific ones.
 
-Recovery follows detection, and assuming nothing block recovery (read further below)
+Recovery follows detection, and assuming nothing blocks recovery (read further below)
 
 For greater resolution, different configuration applies for master recovery and for intermediate-master recovery. Detailed breakdown of recovery-related configuration follows.
 
@@ -109,6 +98,45 @@ The analysis mechanism runs at all times, and checks periodically for failure/re
 - For an instance belonging to a cluster for which recovery is explicitly enabled via configuration
 - For an instance in a cluster that has not recently been recovered, unless such recent recoveries were acknowledged
 - Where global recoveries are enabled
+
+### Graceful master promotion
+
+TL;DR use this for replacing a master in an orderly, planned operation.
+
+Typically for purposes of upgrade, host maintenance, etc., you may wish to replace an existing master with another one. This is a gracefull promotion (aka _graceful master takeover_).
+
+In a graceful takeover:
+
+- You indicate a server to promote.
+- `orchestrator` turns your master to be `read-only`.
+- `orchestrator` makes sure your designated server is caught up with replication.
+- `orchestrator` promotes your designated server as the new master.
+- `orchestrator` turns promoted server to be writable.
+
+The operation can take a few seconds, during which time your app is expected to complain, seeing that the master is `read-only`.
+
+In addition to standard hooks, `orchestrator` provides you with specialized hooks to run a graceful takeover:
+
+- `PreGracefulTakeoverProcesses`
+- `PostGracefulTakeoverProcesses`
+
+For example, you may want to disable the pager for the duration of a planned failover. Advanced usage may include stalling traffic at proxy layer.
+
+In a graceful promotion you must either:
+
+- Indicate the designated master (must be a direct replica of the existing master)
+- Set your topology such that there is exactly one direct replica under the master (at which case the identity of the designated replica is trivial and needs not be mentioned).
+
+Invoke graceful takeover via:
+
+* Command line: `orchestrator-client -c graceful-master-takeover -alias mycluster -s designated.master.to.promote:3306`
+
+* Web API:
+
+  - `/api/graceful-master-takeover/:clusterHint/:designatedHost/:designatedPort`: gracefully promote a new master (planned failover), indicating the designated master to promote.
+  - `/api/graceful-master-takeover/:clusterHint`: gracefully promote a new master (planned failover). Designated server not indicated, works when the master has exactly one direct replica.
+
+* Web interface: drag a direct master's replica onto the left half of the master's box.
 
 ### Manual recovery
 
@@ -122,7 +150,7 @@ Recover via:
 * Web API: `/api/recover/dead.instance.com/:3306`
 * Web: instance is colored black; click the `Recover` button
 
-Manual recoveries don't block on `RecoveryPeriodBlockSeconds` (read more in next section). They also override `RecoverMasterClusterFilters` and `RecoverIntermediateMasterClusterFilters`. A manual recovery will only block on an already running (and incomplete) recovery on the very same instance the manual recovery wishes to operate on.
+Manual recoveries don't block on `RecoveryPeriodBlockSeconds` (read more in next section). They also override `RecoverMasterClusterFilters` and `RecoverIntermediateMasterClusterFilters`. Thus, a human can always invoke a recovery by demand. A recovery may only block on yet another recovery running at that time on the same database instance.
 
 ### Manual, forced failover
 
@@ -138,6 +166,42 @@ Perhaps `orchestrator` doesn't see that the instance is failed, or you have some
   or `/api/force-master-failover/instance.in.that.cluster/3306`
 
 
+### Web, API, command line
+
+Recoveries are audited via:
+
+- `/web/audit-recovery`
+- `/api/audit-recovery`
+- `/api/audit-recovery-steps/:uid`
+
+Nuance auditing and control available via:
+- `/api/blocked-recoveries`: see blocked recoveries
+- `/api/ack-recovery/cluster/:clusterHint`: acknowledge a recovery on a given cluster
+- `/api/ack-all-recoveries`: acknowledge all recoveries
+- `/api/disable-global-recoveries`: global switch to disable `orchestrator` from running any recoveries
+- `/api/enable-global-recoveries`: re-enable recoveries
+- `/api/check-global-recoveries`: check is global recoveries are enabled
+
+Running manual recoveries (see next sections):
+
+- `/api/recover/:host/:port`: recover specific host, assuming `orchestrator` agrees there is failure.
+- `/api/recover-lite/:host/:port`: same, do not invoke external hooks (can be useful for testing)
+- `/api/graceful-master-takeover/:clusterHint/:designatedHost/:designatedPort`: gracefully promote a new master (planned failover), indicating the designated master to promote.
+- `/api/graceful-master-takeover/:clusterHint`: gracefully promote a new master (planned failover). Designated server not indicated, works when the master has exactly one direct replica.
+- `/api/force-master-failover/:clusterHint`: panic, force master failover for given cluster
+
+Some corresponding command line invocations:
+
+- `orchestrator-client -c recover -i some.instance:3306`
+- `orchestrator-client -c graceful-master-takeover -i some.instance.in.somecluster:3306`
+- `orchestrator-client -c graceful-master-takeover -alias somecluster`
+- `orchestrator-client -c force-master-takeover -alias somecluster`
+- `orchestrator-client -c ack-cluster-recoveries -alias somecluster`
+- `orchestrator-client -c ack-all-recoveries`
+- `orchestrator-client -c disable-global-recoveries`
+- `orchestrator-client -c enable-global-recoveries`
+- `orchestrator-client -c check-global-recoveries`
+
 #### Blocking, acknowledgements, anti-flapping
 
 `orchestrator` avoid flapping (cascading failures causing continuous outage and elimination of resources) by introducing a block period, where on any given cluster, `orchesrartor` will not kick in automated recovery on an interval smaller than said period, unless cleared to do so by a human.
@@ -149,6 +213,38 @@ Pending recoveries are unblocked either once `RecoveryPeriodBlockSeconds` has pa
 Acknowledging a recovery is possible either via web API/interface (see audit/recovery page) or via command line interface (`orchestrator-client -c ack-cluster-recoveries -alias somealias`).
 
 Note that manual recovery (e.g. `orchestrator-client -c recover` or `orchstrator-client -c force-master-failover`) ignores the blocking period.
+
+
+### Adding promotion rules
+
+Some servers are better candidate for promotion in the event of failovers. Some servers aren't good picks. Examples:
+
+- A server has weaker hardware configuration. You prefer to not promote it.
+- A server is in a remote data center and you don't want to promote it.
+- A server is used as your backup source and has LVM snapshots open at all times. You don't want to promote it.
+- A server has a good setup and is ideal as candidate. You prefer to promote it.
+- A server is OK, and you don't have any particular opinion.
+
+You will announce your preference for a given server to `orchestrator` in the following way:
+
+```
+orchestrator -c register-candidate -i ${::fqdn} --promotion-rule ${promotion_rule}
+```
+
+Supported promotion rules are:
+
+- `prefer`
+- `neutral`
+- `prefer_not`
+- `must_not`
+
+Promotion rules expire after an hour. That's the dynamic nature of `orchestrator`. You will want to setup a cron job that will announce the promotion rule for a server:
+
+```
+*/2 * * * * root "/usr/bin/perl -le 'sleep rand 10' && /usr/bin/orchestrator-client -c register-candidate -i this.hostname.com --promotion-rule prefer"
+```
+
+This setup comes from production environments. The cron entries get updated by `puppet` to reflect the appropriate `promotion_rule`. A server may have `prefer` at this time, and `prefer_not` in 5 minutes from now. Integrate your own service discovery method, your own scripting, to provide with your up-to-date `promotion-rule`.
 
 ### Downtime
 
@@ -164,8 +260,10 @@ Note that manual recovery (e.g. `orchestrator-client -c recover`) overrides down
 `orchestrator` supports hooks -- external scripts invoked through the recovery process. These are arrays of commands invoked via shell, in particular `bash`. See hook configuration details in [recovery configuration](configuration-recovery.md#hooks)
 
 - `OnFailureDetectionProcesses`: described in [failure detection](failure-detection.md).
+- `PreGracefulTakeoverProcesses`: invoked on `graceful-master-takeover` command, before master goes `read-only`.
 - `PreFailoverProcesses`
 - `PostMasterFailoverProcesses`
 - `PostIntermediateMasterFailoverProcesses`
 - `PostFailoverProcesses`
 - `PostUnsuccessfulFailoverProcesses`
+- `PostGracefulTakeoverProcesses`: executed on planned, graceful master takeover, after the old master is positioned under the newly promoted master.

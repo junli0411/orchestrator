@@ -128,6 +128,15 @@ body {
     color: #606060;
 }
 
+.instance h3 .pull-right > .glyphicon.text-muted {
+    color: #999999;
+}
+
+.instance h3 .pull-right > .glyphicon.text-danger {
+    color: #a94442;
+}
+
+
 .instance h3 .glyphicon {
     position: inherit;
     cursor: default;
@@ -181,6 +190,15 @@ body {
     color: #ffffff;
 }
 
+.instance h3.label-errant {
+    background-color: #b0b0b0;
+    color: #ffffff;
+}
+
+.instance h3.label-errant .glyphicon {
+    color: #ffffff;
+}
+
 .instance h3.label-fatal {
     background-color: #000000;
     color: #ffffff;
@@ -224,6 +242,9 @@ body {
     background-color: #000000;
 }
 
+.instance .badge.label-errant {
+    background-color: #b0b0b0;
+}
 
 .instance .badge.label-primary {
     background-color: #428BCA;
@@ -630,6 +651,10 @@ body {
   padding: 4px;
 }
 
+#cluster_info div[data-tag=analysis] div .pull-left.glyphicon {
+  font-size: 32px;
+}
+
 #cluster_name_info {
   position: fixed;
   z-index: 50;
@@ -644,6 +669,10 @@ body {
 
 #cluster_name {
   font-size: 24px;
+}
+
+#cluster_subtitle {
+  font-size: 12px;
 }
 
 .arrow_box {
@@ -930,13 +959,16 @@ body {
 }
 
 
-#orchestratorStatusTable {
+.status-table {
     font: 12px sans-serif;
 }
 
-#orchestratorStatusTable code {
+.status-table code {
     font-size: 100%;
     background-color: inherit;
+}
+.status-table .long-text {
+  overflow: auto;
 }
 
 .instance.instance-search {

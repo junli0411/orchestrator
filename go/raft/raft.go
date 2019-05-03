@@ -27,9 +27,11 @@ import (
 	"time"
 
 	"github.com/github/orchestrator/go/config"
+	"github.com/github/orchestrator/go/util"
 	"github.com/openark/golib/log"
 
 	"github.com/hashicorp/raft"
+	"github.com/patrickmn/go-cache"
 )
 
 const (
@@ -48,6 +50,9 @@ var RaftNotRunning = fmt.Errorf("raft is not configured/running")
 var store *Store
 var raftSetupComplete int64
 var ThisHostname string
+var healthRequestAuthenticationTokenCache = cache.New(config.RaftHealthPollSeconds*2*time.Second, time.Second)
+var healthReportsCache = cache.New(config.RaftHealthPollSeconds*2*time.Second, time.Second)
+var healthRequestReportCache = cache.New(time.Second, time.Second)
 
 var fatalRaftErrorChan = make(chan error)
 
@@ -57,6 +62,7 @@ type leaderURI struct {
 }
 
 var LeaderURI leaderURI
+var thisLeaderURI string // How this node identifies itself assuming it is the leader
 
 func (luri *leaderURI) Get() string {
 	luri.Lock()
@@ -68,6 +74,12 @@ func (luri *leaderURI) Set(uri string) {
 	luri.Lock()
 	defer luri.Unlock()
 	luri.uri = uri
+}
+
+func (luri *leaderURI) IsThisLeaderURI() bool {
+	luri.Lock()
+	defer luri.Unlock()
+	return luri.uri == thisLeaderURI
 }
 
 func IsRaftEnabled() bool {
@@ -82,17 +94,24 @@ func FatalRaftError(err error) error {
 }
 
 func computeLeaderURI() (uri string, err error) {
-	protocol := "http"
-	if config.Config.UseSSL {
-		protocol = "https"
+	if config.Config.HTTPAdvertise != "" {
+		// Explicitly given
+		return config.Config.HTTPAdvertise, nil
 	}
+	// Not explicitly given. Let's heuristically compute using RaftAdvertise
+	scheme := "http"
+	if config.Config.UseSSL {
+		scheme = "https"
+	}
+
 	hostname := config.Config.RaftAdvertise
 	listenTokens := strings.Split(config.Config.ListenAddress, ":")
 	if len(listenTokens) < 2 {
 		return uri, fmt.Errorf("computeLeaderURI: cannot determine listen port out of config.Config.ListenAddress: %+v", config.Config.ListenAddress)
 	}
 	port := listenTokens[1]
-	uri = fmt.Sprintf("%s://%s:%s", protocol, hostname, port)
+
+	uri = fmt.Sprintf("%s://%s:%s", scheme, hostname, port)
 	return uri, nil
 }
 
@@ -118,22 +137,29 @@ func Setup(applier CommandApplier, snapshotCreatorApplier SnapshotCreatorApplier
 		}
 		peerNodes = append(peerNodes, peerNode)
 	}
+	if len(peerNodes) == 1 && peerNodes[0] == raftAdvertise {
+		// To run in single node setup we will either specify an empty RaftNodes, or a single
+		// raft node that is exactly RaftAdvertise
+		peerNodes = []string{}
+	}
 	if err := store.Open(peerNodes); err != nil {
 		return log.Errorf("failed to open raft store: %s", err.Error())
 	}
 
-	if leaderURI, err := computeLeaderURI(); err != nil {
+	thisLeaderURI, err = computeLeaderURI()
+	if err != nil {
 		return FatalRaftError(err)
-	} else {
-		leaderCh := store.raft.LeaderCh()
-		go func() {
-			for isTurnedLeader := range leaderCh {
-				if isTurnedLeader {
-					PublishCommand("leader-uri", leaderURI)
-				}
-			}
-		}()
 	}
+
+	leaderCh := store.raft.LeaderCh()
+	go func() {
+		for isTurnedLeader := range leaderCh {
+			if isTurnedLeader {
+				PublishCommand("leader-uri", thisLeaderURI)
+			}
+		}
+	}()
+
 	setupHttpClient()
 
 	atomic.StoreInt64(&raftSetupComplete, 1)
@@ -293,11 +319,40 @@ func PublishYieldHostnameHint(hostnameHint string) (response interface{}, err er
 	return store.genericCommand(YieldHintCommand, []byte(hostnameHint))
 }
 
+// ReportToRaftLeader tells the leader this raft node is raft-healthy
+func ReportToRaftLeader(authenticationToken string) (err error) {
+	if err := healthRequestReportCache.Add(config.Config.RaftBind, true, cache.DefaultExpiration); err != nil {
+		// Recently reported
+		return nil
+	}
+	path := fmt.Sprintf("raft-follower-health-report/%s/%s/%s", authenticationToken, config.Config.RaftBind, config.Config.RaftAdvertise)
+	_, err = HttpGetLeader(path)
+	return err
+}
+
+// OnHealthReport acts on a raft-member reporting its health
+func OnHealthReport(authenticationToken, raftBind, raftAdvertise string) (err error) {
+	if _, found := healthRequestAuthenticationTokenCache.Get(authenticationToken); !found {
+		return log.Errorf("Raft health report: unknown token %s", authenticationToken)
+	}
+	healthReportsCache.Set(raftAdvertise, true, cache.DefaultExpiration)
+	return nil
+}
+
+func HealthyMembers() (advertised []string) {
+	items := healthReportsCache.Items()
+	for raftAdvertised := range items {
+		advertised = append(advertised, raftAdvertised)
+	}
+	return advertised
+}
+
 // Monitor is a utility function to routinely observe leadership state.
 // It doesn't actually do much; merely takes notes.
 func Monitor() {
 	t := time.Tick(5 * time.Second)
 	heartbeat := time.Tick(1 * time.Minute)
+	followerHealthTick := time.Tick(config.RaftHealthPollSeconds * time.Second)
 	for {
 		select {
 		case <-t:
@@ -311,6 +366,12 @@ func Monitor() {
 		case <-heartbeat:
 			if IsLeader() {
 				go PublishCommand("heartbeat", "")
+			}
+		case <-followerHealthTick:
+			if IsLeader() {
+				athenticationToken := util.NewToken().Short()
+				healthRequestAuthenticationTokenCache.Set(athenticationToken, true, cache.DefaultExpiration)
+				go PublishCommand("request-health-report", athenticationToken)
 			}
 		case err := <-fatalRaftErrorChan:
 			log.Fatale(err)
